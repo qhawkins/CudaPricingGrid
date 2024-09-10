@@ -2,53 +2,64 @@
 #include <vector>
 #include <cmath>
 #include <algorithm>
+#include <chrono>
 
-enum class OptionType { Call, Put };
+#include "kernels.cuh"
 
-class AmericanOptionPricer {
+#define CHECK_CUDA_ERROR(call) \
+do { \
+    cudaError_t err = call; \
+    if (err != cudaSuccess) { \
+        fprintf(stderr, "CUDA error in %s:%d: %s\n", __FILE__, __LINE__, \
+                cudaGetErrorString(err)); \
+        exit(EXIT_FAILURE); \
+    } \
+} while(0)
+
+class CRROptionPricer {
 private:
     double S, K, r, q, T, tol;
-    int steps, max_iter;
-    OptionType optionType;
+    int steps, max_iter, optionType;
+    cudaStream_t stream;
 
 public:
-    AmericanOptionPricer(double S, double K, double r, double q, double T, int steps, OptionType type, double tol, int max_iter)
-        : S(S), K(K), r(r), q(q), T(T), steps(steps), optionType(type), tol(tol), max_iter(max_iter) {}
+    CRROptionPricer(double S, double K, double r, double q, double T, int steps, int type, double tol, int max_iter, cudaStream_t stream)
+        : S(S), K(K), r(r), q(q), T(T), steps(steps), optionType(type), tol(tol), max_iter(max_iter), stream(stream) {}
 
     double price(double sigma) {
         double dt = T / steps;
         double u = std::exp(sigma * std::sqrt(dt));
-        double d = 1 / u;
+        double d = 1.0 / u;
         double p = (std::exp((r - q) * dt) - d) / (u - d);
 
-        std::vector<double> prices(steps + 1);
-        std::vector<double> values(steps + 1);
+        double* d_prices;
+        double* d_values;
 
-        // Initialize asset prices at expiration
-        for (int i = 0; i <= steps; ++i) {
-            prices[i] = S * std::pow(u, steps - i) * std::pow(d, i);
-            if (optionType == OptionType::Call) {
-                values[i] = std::max(0.0, prices[i] - K);
-            } else {
-                values[i] = std::max(0.0, K - prices[i]);
-            }
-        }
+        CHECK_CUDA_ERROR(cudaMallocAsync(&d_prices, (steps + 1) * sizeof(double), stream));
+        CHECK_CUDA_ERROR(cudaMallocAsync(&d_values, (steps + 1) * sizeof(double), stream));
 
-        // Backward induction
-        for (int step = steps - 1; step >= 0; --step) {
-            for (int i = 0; i <= step; ++i) {
-                double spotPrice = S * std::pow(u, step - i) * std::pow(d, i);
-                double expectedValue = (p * values[i] + (1 - p) * values[i + 1]) * std::exp(-r * dt);
-                
-                if (optionType == OptionType::Call) {
-                    values[i] = std::max(expectedValue, spotPrice - K);
-                } else {
-                    values[i] = std::max(expectedValue, K - spotPrice);
-                }
-            }
-        }
+        int block_size = 256;
+        int grid_size = (steps + block_size - 1) / block_size;
 
-        return values[0];
+        initializeAssetPrices<<<grid_size, block_size, 0, stream>>>(d_prices, d_values, S, K, u, d, steps, optionType);
+        CHECK_CUDA_ERROR(cudaStreamSynchronize(stream));
+
+        std::vector<double> h_prices(steps + 1);
+        std::vector<double> h_values(steps + 1);
+
+        for (int i = steps - 1; i >= 0; i--) {
+            backwardInduction<<<grid_size, block_size, 0, stream>>>(d_values, d_prices, i, S, K, p, r, dt, u, d, optionType);
+            CHECK_CUDA_ERROR(cudaStreamSynchronize(stream));    
+        }   
+
+        double result[steps+1];
+        CHECK_CUDA_ERROR(cudaMemcpyAsync(&result, d_values, (steps+1) * sizeof(double), cudaMemcpyDeviceToHost, stream));
+        CHECK_CUDA_ERROR(cudaStreamSynchronize(stream));
+
+        CHECK_CUDA_ERROR(cudaFreeAsync(d_prices, stream));
+        CHECK_CUDA_ERROR(cudaFreeAsync(d_values, stream));
+
+        return result[0];
     }
 
     double computeIV(double optionPrice) {
@@ -56,7 +67,7 @@ public:
             return price(sigma) - optionPrice;
         };
         // Initial guess
-        double a = 0.01;
+        double a = 0.1;
         double b = 10.0;
         double fa = f(a);
         double fb = f(b);
@@ -139,21 +150,38 @@ public:
 int main() {
     double S = 100;  // Current stock price
     double K = 100;  // Strike price
-    double mP = 6.76; // Market price
     double r = 0.05;  // Risk-free rate
     double q = 0;     // Dividend yield
-    double sigma = 0.2;  // Volatility
     double T = 1.0;   // Time to maturity in years
     int steps = 1000;  // Number of steps in the binomial tree
 
-    AmericanOptionPricer putPricer(S, K, r, q, T, steps, OptionType::Put, .00001, 1000);
-    double callIV = putPricer.computeIV(mP);
+    cudaStream_t stream;
+    CHECK_CUDA_ERROR(cudaStreamCreate(&stream));
+    CHECK_CUDA_ERROR(cudaStreamSynchronize(stream));
 
-    AmericanOptionPricer callPricer(S, K, r, q, T, steps, OptionType::Call, .00001, 1000);
-    double putIV = callPricer.computeIV(mP);
+    std::vector<double> test_volatilities = {0.1, 0.2, 0.3, 0.4, 0.5};
 
-    std::cout << "The IV of the American put option is: " << callIV << std::endl;
-    std::cout << "The IV of the American call option is: " << putIV << std::endl;
+    std::cout << "Call Option Prices:" << std::endl;
+    CRROptionPricer callPricer(S, K, r, q, T, steps, 0, .00001, 1000, stream);
+    for (double vol : test_volatilities) {
+        double price = callPricer.price(vol);
+        std::cout << "Volatility: " << vol << ", Price: " << price << std::endl;
+    }
+
+    //std::cout << "\nPut Option Prices:" << std::endl;
+    CRROptionPricer putPricer(S, K, r, q, T, steps, 1, .00001, 1000, stream);
+    for (double vol : test_volatilities) {
+        double price = putPricer.price(vol);
+        std::cout << "Volatility: " << vol << ", Price: " << price << std::endl;
+    }
+
+    // Test implied volatility calculation
+    double marketPrice = 10.0;  // Example market price
+    std::cout << "\nImplied Volatility Calculation:" << std::endl;
+    std::cout << "Call IV: " << callPricer.computeIV(marketPrice) << std::endl;
+    std::cout << "Put IV: " << putPricer.computeIV(marketPrice) << std::endl;
+
+    CHECK_CUDA_ERROR(cudaStreamDestroy(stream));
 
     return 0;
 }
