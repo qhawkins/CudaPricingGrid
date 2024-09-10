@@ -4,18 +4,11 @@
 #include <string>
 
 struct GridParams {
-    float S0;      // Initial stock price
-    float K;       // Strike price
-    float T;       // Time to expiration
-    float r;       // Risk-free rate
-    float sigma;   // Volatility
-    int M;         // Number of time steps
-    int N;         // Number of stock price steps
-    float dt;      // Time step size
-    float dS;      // Stock price step size
-    float Smax;    // Maximum stock price in the grid
-    float contractType; // 0 for call, 1 for put
-    float optionPrice; // Price of the option
+    float S0, K, T, r, sigma;
+    int M, N;
+    float dt, dS, Smax, Smin;
+    int contractType; // 0 for call, 1 for put
+    float optionPrice;
 };
 
 struct OptionData {
