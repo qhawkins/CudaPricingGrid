@@ -45,6 +45,15 @@ __global__ void backwardInduction(double* values, double* prices, int step, doub
     }
 }
 
+struct GreekParams {
+    double dSpot;       // Step size for spot price
+    double dStrike;     // Step size for strike price
+    double dRate;       // Step size for interest rate
+    double dYield;      // Step size for dividend yield
+    double dTime;       // Step size for time to maturity
+    double dVol;        // Step size for volatility
+};
+
 class CRROptionPricer {
 private:
     double S, K, r, q, T, tol;
@@ -120,7 +129,79 @@ public:
     CRROptionPricer(double S, double K, double r, double q, double T, int steps, int type, double tol, int max_iter, cudaStream_t stream)
         : S(S), K(K), r(r), q(q), T(T), steps(steps), optionType(type), tol(tol), max_iter(max_iter), stream(stream) {}
 
-    std::unordered_map<std::string, double> calculateAllGreeks(double sigma, double h = 1.0) {
+
+    std::unordered_map<std::string, double> calculateAllGreeks(double sigma, const GreekParams& params) {
+        std::unordered_map<std::string, double> greeks;
+        
+        // Base price
+        double basePrice = getCachedPrice(0, 0, 0, 0, 0, sigma);
+        
+        // 1st-order Greeks
+        double priceUpS = getCachedPrice(params.dSpot, 0, 0, 0, 0, sigma);
+        double priceDownS = getCachedPrice(-params.dSpot, 0, 0, 0, 0, sigma);
+        greeks["delta"] = (priceUpS - priceDownS) / (2 * params.dSpot);
+        
+        double priceUpSigma = getCachedPrice(0, 0, 0, 0, 0, sigma + params.dVol);
+        double priceDownSigma = getCachedPrice(0, 0, 0, 0, 0, sigma - params.dVol);
+        greeks["vega"] = ((priceUpSigma - priceDownSigma) / (2 * params.dVol))/100;
+        
+        double priceUpT = getCachedPrice(0, 0, 0, 0, params.dTime, sigma);
+        greeks["theta"] = -(priceUpT - basePrice) / params.dTime;
+        
+        double priceUpR = getCachedPrice(0, 0, params.dRate, 0, 0, sigma);
+        greeks["rho"] = ((priceUpR - basePrice) / params.dRate)/100;
+        
+        double priceUpQ = getCachedPrice(0, 0, 0, params.dYield, 0, sigma);
+        greeks["epsilon"] = (priceUpQ - basePrice) / params.dYield;
+        
+        greeks["lambda"] = greeks["delta"] * S / basePrice;
+
+        // 2nd-order Greeks
+        greeks["gamma"] = (priceUpS - 2 * basePrice + priceDownS) / (params.dSpot * params.dSpot);
+        
+        greeks["vanna"] = (getCachedPrice(params.dSpot, 0, 0, 0, 0, sigma + params.dVol) - getCachedPrice(params.dSpot, 0, 0, 0, 0, sigma - params.dVol)
+                        - getCachedPrice(-params.dSpot, 0, 0, 0, 0, sigma + params.dVol) + getCachedPrice(-params.dSpot, 0, 0, 0, 0, sigma - params.dVol)) 
+                        / (4 * params.dSpot * params.dVol);
+        
+        greeks["charm"] = (getCachedPrice(params.dSpot, 0, 0, 0, params.dTime, sigma) - getCachedPrice(params.dSpot, 0, 0, 0, 0, sigma)
+                        - getCachedPrice(-params.dSpot, 0, 0, 0, params.dTime, sigma) + getCachedPrice(-params.dSpot, 0, 0, 0, 0, sigma)) 
+                        / (2 * params.dSpot * params.dTime);
+        
+        greeks["vomma"] = (priceUpSigma - 2 * basePrice + priceDownSigma) / (params.dVol * params.dVol);
+        
+        greeks["veta"] = (getCachedPrice(0, 0, 0, 0, params.dTime, sigma + params.dVol) - getCachedPrice(0, 0, 0, 0, params.dTime, sigma - params.dVol)
+                        - getCachedPrice(0, 0, 0, 0, 0, sigma + params.dVol) + getCachedPrice(0, 0, 0, 0, 0, sigma - params.dVol)) 
+                        / (2 * params.dVol * params.dTime);
+
+        // 3rd-order Greeks
+        double priceUp2S = getCachedPrice(2*params.dSpot, 0, 0, 0, 0, sigma);
+        double priceDown2S = getCachedPrice(-2*params.dSpot, 0, 0, 0, 0, sigma);
+        greeks["speed"] = (priceUp2S - 3*priceUpS + 3*priceDownS - priceDown2S) / (2 * params.dSpot * params.dSpot * params.dSpot);
+        
+        greeks["zomma"] = (getCachedPrice(params.dSpot, 0, 0, 0, 0, sigma + params.dVol) - 2*getCachedPrice(0, 0, 0, 0, 0, sigma + params.dVol) + getCachedPrice(-params.dSpot, 0, 0, 0, 0, sigma + params.dVol)
+                        - getCachedPrice(params.dSpot, 0, 0, 0, 0, sigma - params.dVol) + 2*getCachedPrice(0, 0, 0, 0, 0, sigma - params.dVol) - getCachedPrice(-params.dSpot, 0, 0, 0, 0, sigma - params.dVol)) 
+                        / (2 * params.dSpot * params.dSpot * params.dVol);
+        
+        greeks["color"] = (getCachedPrice(params.dSpot, 0, 0, 0, params.dTime, sigma) - 2*getCachedPrice(0, 0, 0, 0, params.dTime, sigma) + getCachedPrice(-params.dSpot, 0, 0, 0, params.dTime, sigma)
+                        - getCachedPrice(params.dSpot, 0, 0, 0, 0, sigma) + 2*basePrice - getCachedPrice(-params.dSpot, 0, 0, 0, 0, sigma)) 
+                        / (params.dSpot * params.dSpot * params.dTime);
+        
+        greeks["ultima"] = ((getCachedPrice(0, 0, 0, 0, 0, sigma + 2*params.dVol) - 3*getCachedPrice(0, 0, 0, 0, 0, sigma + params.dVol) 
+                        + 3*getCachedPrice(0, 0, 0, 0, 0, sigma - params.dVol) - getCachedPrice(0, 0, 0, 0, 0, sigma - 2*params.dVol)) 
+                        / (params.dVol * params.dVol * params.dVol))/(100*100);
+
+        // Vera (as requested)
+        double priceUpRSigmaUp = getCachedPrice(0, 0, params.dRate, 0, 0, sigma + params.dVol);
+        double priceUpRSigmaDown = getCachedPrice(0, 0, params.dRate, 0, 0, sigma - params.dVol);
+        double priceDownRSigmaUp = getCachedPrice(0, 0, -params.dRate, 0, 0, sigma + params.dVol);
+        double priceDownRSigmaDown = getCachedPrice(0, 0, -params.dRate, 0, 0, sigma - params.dVol);
+        greeks["vera"] = ((priceUpRSigmaUp - priceUpRSigmaDown) - (priceDownRSigmaUp - priceDownRSigmaDown)) 
+                        / (4 * params.dRate * params.dVol);
+
+        return greeks;
+    }
+
+    std::unordered_map<std::string, double> calculateAllGreeksOld(double sigma, double h = 1.0) {
         std::unordered_map<std::string, double> greeks;
         
         // Base price
@@ -157,7 +238,6 @@ public:
 
         greeks["veta"] = (getCachedPrice(0, 0, 0, 0, 1.0/365.0, sigma + 0.01) - 2*basePrice + getCachedPrice(0, 0, 0, 0, 1.0/365.0, sigma - 0.01));
 
-        greeks["vera"] = (getCachedPrice(0, 0, 0, 0, 0, sigma + 0.01) - 2*basePrice + getCachedPrice(0, 0, 0, 0, 0, sigma - 0.01));
 
         
         // Speed
@@ -300,23 +380,34 @@ int main() {
     CHECK_CUDA_ERROR(cudaStreamCreate(&stream));
     CHECK_CUDA_ERROR(cudaStreamSynchronize(stream));
 
+    GreekParams params;
+    params.dSpot = 0.01 * S;    // 1% of spot price
+    params.dStrike = 0.01 * K;  // 1% of strike price
+    params.dRate = 0.0001;      // 1 basis point
+    params.dYield = 0.0001;     // 1 basis point
+    params.dTime = 1.0 / 365.0; // 1 day
+    params.dVol = 0.01;         // 1 volatility point
+
     std::vector<double> test_volatilities = {0.1, 0.2, 0.3, 0.4, 0.5};
 
     CRROptionPricer callPricer(S, K, r, q, T, steps, 0, .00001, 1000, stream);
     CRROptionPricer putPricer(S, K, r, q, T, steps, 1, .00001, 1000, stream);
-    std::cout << "Call Greeks:" << std::endl;
-    auto greeks = callPricer.calculateAllGreeks(0.2);
-    callPricer.printGreeks(greeks);
-
-    std::cout << "\nPut Greeks:" << std::endl;
-    greeks = putPricer.calculateAllGreeks(0.2);
-    putPricer.printGreeks(greeks);
     
     // Test implied volatility calculation
     double marketPrice = 10.0;  // Example market price
     std::cout << "\nImplied Volatility Calculation:" << std::endl;
-    std::cout << "Call IV: " << callPricer.computeIV(marketPrice) << std::endl;
-    std::cout << "Put IV: " << putPricer.computeIV(marketPrice) << std::endl;
+    double callIV = callPricer.computeIV(marketPrice);
+    double putIV = putPricer.computeIV(marketPrice);
+    std::cout << "Call IV: " << callIV << std::endl;
+    std::cout << "Put IV: " << putIV << std::endl;
+
+    std::cout << "Call Greeks:" << std::endl;
+    auto greeks = callPricer.calculateAllGreeks(callIV, params);
+    callPricer.printGreeks(greeks);
+
+    std::cout << "\nPut Greeks:" << std::endl;
+    greeks = putPricer.calculateAllGreeks(putIV, params);
+    putPricer.printGreeks(greeks);
 
     CHECK_CUDA_ERROR(cudaStreamDestroy(stream));
 
