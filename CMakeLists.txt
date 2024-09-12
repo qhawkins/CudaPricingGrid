@@ -17,9 +17,9 @@ set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 -gencode arch=compute_89,code=sm_8
 link_libraries(-lcublas -lcusolver)
 add_executable(CudaPricingGrid 
                main.cu
-               kernels.cuh
+               kernels.cu
                )
-set_source_files_properties(main.cu kernels.cuh PROPERTIES FORCE_LANGUAGE CUDA LINKER_LANGUAGE CUDA)
+set_source_files_properties(main.cu kernels.cu PROPERTIES FORCE_LANGUAGE CUDA LINKER_LANGUAGE CUDA)
 
 #add_executable(CudaNse bs.cu)
 #set_target_properties(CudaNse PROPERTIES LINKER_LANGUAGE CUDA CUDA_ARCHITECTURES 89)

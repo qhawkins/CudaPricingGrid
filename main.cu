@@ -7,13 +7,15 @@
 #include <cuda_runtime.h>
 #include <fstream>
 #include <sstream>
-#include "structs.h"
 #include <queue>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
 #include <functional>
 #include <future>
+
+#include "structs.h"
+#include "kernels.cuh"
 
 #define CHECK_CUDA_ERROR(call) \
 do { \
@@ -81,35 +83,6 @@ private:
     std::condition_variable condition;
     bool stop;
 };
-
-// CUDA Kernels
-__global__ void initializeAssetPrices(double* prices, double* values, double S, double K, double u, double d, int steps, int optionType) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx <= steps) {
-        prices[idx] = S * pow(u, steps - idx) * pow(d, idx);
-        if (optionType == 0) { // Call
-            values[idx] = fmax(0.0, prices[idx] - K);
-        } else { // Put
-            values[idx] = fmax(0.0, K - prices[idx]);
-        }
-    }
-}
-
-__global__ void backwardInduction(double* values, double* prices, int step, double S, double K, double p, double r, double dt, double u, double d, int optionType) {
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    if (idx <= step) {
-        double spotPrice = S * pow(u, step - idx) * pow(d, idx);
-        double expectedValue = p * values[idx] + (1 - p) * values[idx + 1];
-        expectedValue *= exp(-r * dt);
-        double intrinsicValue;
-        if (optionType == 0) { // Call
-            intrinsicValue = fmax(0.0, spotPrice - K);
-        } else { // Put
-            intrinsicValue = fmax(0.0, K - spotPrice);
-        }
-        values[idx] = fmax(expectedValue, intrinsicValue);
-    }
-}
 
 struct GreekParams {
     double dSpot;       // Step size for spot price
@@ -534,15 +507,11 @@ int main() {
     }
     auto end = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> elapsed = end - start;
-    std::cout << "Elapsed time: " << elapsed.count() << "s" << std::endl;
 
     // Clean up CUDA streams
     for (int i = 0; i < NUM_STREAMS; ++i) {
         CHECK_CUDA_ERROR(cudaStreamDestroy(streams[i]));
     }
-
-    exit(1094782);
-
     // Print or save results
     for (const auto& result : final_results) {
         std::cout << "Contract ID: " << result.contract_id << std::endl;
@@ -565,6 +534,8 @@ int main() {
         std::cout << "Ultima: " << result.ultima << std::endl;
         std::cout << std::endl;
     }
+    std::cout << "Elapsed time: " << elapsed.count() << "s" << std::endl;
+
 
     return 0;
 }
