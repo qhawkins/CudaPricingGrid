@@ -25,8 +25,6 @@ struct OptionData {
     float vega;
     float theta;
     float rho;
-    float lambda;
-    float epsilon;
 
     // Second-order Greeks
     float gamma;
