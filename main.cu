@@ -85,82 +85,168 @@ private:
 };
 
 struct GreekParams {
-    double dSpot;       // Step size for spot price
-    double dStrike;     // Step size for strike price
-    double dRate;       // Step size for interest rate
-    double dYield;      // Step size for dividend yield
-    double dTime;       // Step size for time to maturity
-    double dVol;        // Step size for volatility
+    double* dSpot;       // Step size for spot price
+    double* dStrike;     // Step size for strike price
+    double* dRate;       // Step size for interest rate
+    double* dYield;      // Step size for dividend yield
+    double* dTime;       // Step size for time to maturity
+    double* dVol;        // Step size for volatility
 };
 
 class CRROptionPricer {
 private:
-    double S, K, r, q, T, tol;
-    int steps, max_iter, optionType;
+    double *S, *K, *r, *q, *T, tol, *marketPrices;
+    int steps, max_iter, *optionType;
     cudaStream_t stream;
     double *d_prices, *d_values;
+    int batch_size;
+    double *sigma;
 
 
     struct PriceCache {
-        double price;
-        double S, K, r, q, T, sigma;
-        PriceCache(double p, double s, double k, double r, double q, double t, double sig)
+        double* price;
+        double *S, *K, *r, *q, *T, *sigma;
+        PriceCache(double* p, double* s, double* k, double* r, double* q, double* t, double* sig)
             : price(p), S(s), K(k), r(r), q(q), T(t), sigma(sig) {}
     };
 
     std::vector<PriceCache> priceCache;
 
 public:
-    double getCachedPrice(double shiftS, double shiftK, double shiftR, double shiftQ, double shiftT, double shiftSigma) {
-        double currentS = S + shiftS;
-        double currentK = K + shiftK;
-        double currentR = r + shiftR;
-        double currentQ = q + shiftQ;
-        double currentT = T + shiftT;
-        double currentSigma = shiftSigma;
+    double* getCachedPrice(double* shiftS, double* shiftK, double* shiftR, double* shiftQ, double* shiftT, double* shiftSigma, int* optionType) {
+        double* currentS;
+        double* currentK;
+        double* currentR;
+        double* currentQ;
+        double* currentT;
+        double* currentSigma;
+        double* price;
+        int* type;
 
-        for (const auto& cache : priceCache) {
-            if (std::abs(cache.S - currentS) < 1e-10 &&
-                std::abs(cache.K - currentK) < 1e-10 &&
-                std::abs(cache.r - currentR) < 1e-10 &&
-                std::abs(cache.q - currentQ) < 1e-10 &&
-                std::abs(cache.T - currentT) < 1e-10 &&
-                std::abs(cache.sigma - currentSigma) < 1e-10) {
-                return cache.price;
-            }
+        for (int i = 0; i < batch_size; i++) {
+            currentS[i] = S[i] + shiftS[i];
+            currentK[i] = K[i] + shiftK[i];
+            currentR[i] = r[i] + shiftR[i];
+            currentQ[i] = q[i] + shiftQ[i];
+            currentT[i] = T[i] + shiftT[i];
+
+            // Update sigma, currently array, may need to be changed
+            currentSigma[i] = shiftSigma[i];
+
+
+            price[i] = 0;
+            type[i] = optionType[i];
         }
 
-        double price = calculatePrice(currentS, currentK, currentR, currentQ, currentT, currentSigma);
+        double* to_calc_S;
+        double* to_calc_K;
+        double* to_calc_R;
+        double* to_calc_Q;
+        double* to_calc_T;
+        double* to_calc_Sigma;
+        double** to_calc_Price;
+        int* to_calc_Type;
+    
+        int index = 0;
+
+        // Check if price is already cached
+        for (auto& cache : priceCache) {
+            for (int i = 0; i < batch_size; i++) {
+                if (std::abs(cache.S[i] - currentS[i]) > 1e-10 &&
+                    std::abs(cache.K[i] - currentK[i]) > 1e-10 &&
+                    std::abs(cache.r[i] - currentR[i]) > 1e-10 &&
+                    std::abs(cache.q[i] - currentQ[i]) > 1e-10 &&
+                    std::abs(cache.T[i] - currentT[i]) > 1e-10 &&
+                    std::abs(cache.sigma[i] - currentSigma[i]) > 1e-10) {
+                    
+                        to_calc_S[index] = currentS[i];
+                        to_calc_K[index] = currentK[i];
+                        to_calc_R[index] = currentR[i];
+                        to_calc_Q[index] = currentQ[i];
+                        to_calc_T[index] = currentT[i];
+                        to_calc_Sigma[index] = currentSigma[i];
+                        to_calc_Price[index] = &price[i];
+                        to_calc_Type[index] = type[i];
+                        index++;
+                }
+            }
+        }
+        int blockSize = 256;
+        int numBlocks = (index + blockSize - 1) / blockSize;
+
+        double* d_to_calc_S;
+        double* d_to_calc_K;
+        double* d_to_calc_R;
+        double* d_to_calc_Q;
+        double* d_to_calc_T;
+        double* d_to_calc_Sigma;
+        double** d_to_calc_Price;
+        int* d_to_calc_Type;
+
+        CHECK_CUDA_ERROR(cudaMallocAsync(&d_to_calc_S, index * sizeof(double), stream));
+        CHECK_CUDA_ERROR(cudaMallocAsync(&d_to_calc_K, index * sizeof(double), stream));
+        CHECK_CUDA_ERROR(cudaMallocAsync(&d_to_calc_R, index * sizeof(double), stream));
+        CHECK_CUDA_ERROR(cudaMallocAsync(&d_to_calc_Q, index * sizeof(double), stream));
+        CHECK_CUDA_ERROR(cudaMallocAsync(&d_to_calc_T, index * sizeof(double), stream));
+        CHECK_CUDA_ERROR(cudaMallocAsync(&d_to_calc_Sigma, index * sizeof(double), stream));
+        CHECK_CUDA_ERROR(cudaMallocAsync(&d_to_calc_Price, index * sizeof(double*), stream));
+        CHECK_CUDA_ERROR(cudaMallocAsync(&d_to_calc_Type, index * sizeof(int), stream));
+        
+        CHECK_CUDA_ERROR(cudaStreamSynchronize(stream));
+
+        CHECK_CUDA_ERROR(cudaMemcpyAsync(d_to_calc_S, to_calc_S, index * sizeof(double), cudaMemcpyHostToDevice, stream));
+        CHECK_CUDA_ERROR(cudaMemcpyAsync(d_to_calc_K, to_calc_K, index * sizeof(double), cudaMemcpyHostToDevice, stream));
+        CHECK_CUDA_ERROR(cudaMemcpyAsync(d_to_calc_R, to_calc_R, index * sizeof(double), cudaMemcpyHostToDevice, stream));
+        CHECK_CUDA_ERROR(cudaMemcpyAsync(d_to_calc_Q, to_calc_Q, index * sizeof(double), cudaMemcpyHostToDevice, stream));
+        CHECK_CUDA_ERROR(cudaMemcpyAsync(d_to_calc_T, to_calc_T, index * sizeof(double), cudaMemcpyHostToDevice, stream));
+        CHECK_CUDA_ERROR(cudaMemcpyAsync(d_to_calc_Sigma, to_calc_Sigma, index * sizeof(double), cudaMemcpyHostToDevice, stream));
+        CHECK_CUDA_ERROR(cudaMemcpyAsync(d_to_calc_Price, to_calc_Price, index * sizeof(double*), cudaMemcpyHostToDevice, stream));
+        CHECK_CUDA_ERROR(cudaMemcpyAsync(d_to_calc_Type, to_calc_Type, index * sizeof(int), cudaMemcpyHostToDevice, stream));
+
+        CHECK_CUDA_ERROR(cudaStreamSynchronize(stream));
+
+        calculatePrice<<<numBlocks, blockSize, 0, stream>>>(steps, batch_size, price, to_calc_S, to_calc_K, to_calc_R, to_calc_Q, to_calc_T, to_calc_Type, to_calc_Sigma);
+        
+        CHECK_CUDA_ERROR(cudaStreamSynchronize(stream));
+
+        CHECK_CUDA_ERROR(cudaFree(d_to_calc_S));
+        CHECK_CUDA_ERROR(cudaFree(d_to_calc_K));
+        CHECK_CUDA_ERROR(cudaFree(d_to_calc_R));
+        CHECK_CUDA_ERROR(cudaFree(d_to_calc_Q));
+        CHECK_CUDA_ERROR(cudaFree(d_to_calc_T));
+        CHECK_CUDA_ERROR(cudaFree(d_to_calc_Sigma));
+        CHECK_CUDA_ERROR(cudaFree(d_to_calc_Price));
+        CHECK_CUDA_ERROR(cudaFree(d_to_calc_Type));
+
         priceCache.emplace_back(price, currentS, currentK, currentR, currentQ, currentT, currentSigma);
         return price;
     }
 
-    double calculatePrice(double S, double K, double r, double q, double T, double sigma) {
-        double dt = T / steps;
-        double u = std::exp(sigma * std::sqrt(dt));
-        double d = 1.0 / u;
-        double p = (std::exp((r - q) * dt) - d) / (u - d);
-
-        int block_size = 256;
-        int grid_size = (steps + block_size - 1) / block_size;
-
-        initializeAssetPrices<<<grid_size, block_size, 0, stream>>>(d_prices, d_values, S, K, u, d, steps, optionType);
-
-        for (int i = steps - 1; i >= 0; i--) {
-            backwardInduction<<<grid_size, block_size, 0, stream>>>(d_values, d_prices, i, S, K, p, r, dt, u, d, optionType);
-        }   
-
-        double result;
-        CHECK_CUDA_ERROR(cudaMemcpyAsync(&result, d_values, sizeof(double), cudaMemcpyDeviceToHost, stream));
-        
-        return result;
-    }
-
-    CRROptionPricer(double S, double K, double r, double q, double T, int steps, int type, double tol, int max_iter, cudaStream_t stream)
-        : S(S), K(K), r(r), q(q), T(T), steps(steps), optionType(type), tol(tol), max_iter(max_iter), stream(stream) {
+    CRROptionPricer(int batch_size, double* marketPrices, double* S, double* K, double* r, double* q, double* T, int steps, int* type, double tol, int max_iter, cudaStream_t stream)
+        : S(S), K(K), r(r), q(q), T(T), steps(steps), optionType(type), tol(tol), max_iter(max_iter), stream(stream), batch_size(batch_size), marketPrices(marketPrices) {
         // Allocate device memory
+        double *d_S, *d_K, *d_r, *d_q, *d_T;
+        int *d_optionType;
+    
         CHECK_CUDA_ERROR(cudaMallocAsync(&d_prices, (steps + 1) * sizeof(double), stream));
         CHECK_CUDA_ERROR(cudaMallocAsync(&d_values, (steps + 1) * sizeof(double), stream));
+        CHECK_CUDA_ERROR(cudaMallocAsync(&d_S, batch_size * sizeof(double), stream));
+        CHECK_CUDA_ERROR(cudaMallocAsync(&d_K, batch_size * sizeof(double), stream));
+        CHECK_CUDA_ERROR(cudaMallocAsync(&d_r, batch_size * sizeof(double), stream));
+        CHECK_CUDA_ERROR(cudaMallocAsync(&d_q, batch_size * sizeof(double), stream));
+        CHECK_CUDA_ERROR(cudaMallocAsync(&d_T, batch_size * sizeof(double), stream));
+        CHECK_CUDA_ERROR(cudaMallocAsync(&d_optionType, batch_size * sizeof(int), stream));
+
+        CHECK_CUDA_ERROR(cudaStreamSynchronize(stream));
+
+        CHECK_CUDA_ERROR(cudaMemcpyAsync(d_S, S, batch_size * sizeof(double), cudaMemcpyHostToDevice, stream));
+        CHECK_CUDA_ERROR(cudaMemcpyAsync(d_K, K, batch_size * sizeof(double), cudaMemcpyHostToDevice, stream));
+        CHECK_CUDA_ERROR(cudaMemcpyAsync(d_r, r, batch_size * sizeof(double), cudaMemcpyHostToDevice, stream));
+        CHECK_CUDA_ERROR(cudaMemcpyAsync(d_q, q, batch_size * sizeof(double), cudaMemcpyHostToDevice, stream));
+        CHECK_CUDA_ERROR(cudaMemcpyAsync(d_T, T, batch_size * sizeof(double), cudaMemcpyHostToDevice, stream));
+        CHECK_CUDA_ERROR(cudaMemcpyAsync(d_optionType, type, batch_size * sizeof(int), cudaMemcpyHostToDevice, stream));
+        
+        CHECK_CUDA_ERROR(cudaStreamSynchronize(stream));
     }
     
     ~CRROptionPricer() {
@@ -169,74 +255,115 @@ public:
         CHECK_CUDA_ERROR(cudaFreeAsync(d_values, stream));
     }
 
-    std::unordered_map<std::string, double> calculateAllGreeks(double sigma, const GreekParams& params) {
-        std::unordered_map<std::string, double> greeks;
+    std::unordered_map<std::string, double>* calculateAllGreeks(const GreekParams& params) {
+        std::unordered_map<std::string, double>* greeks;
         
+        double* neg_dSpot;
+        double* neg_dVol;
+        double* neg_dTime;
+        double* neg_dRate;
+        double* neg_dYield;
+        double* plus_sigma;
+        double* minus_sigma;
+        double* plusd2Spot;
+        double* plusd2Vol;
+        double* minusd2Spot;
+        double* minusd2Vol;
+
+
+        for (int i = 0; i < batch_size; i++) {
+            neg_dSpot[i] = -params.dSpot[i];
+            neg_dVol[i] = -params.dVol[i];
+            neg_dTime[i] = -params.dTime[i];
+            neg_dRate[i] = -params.dRate[i];
+            neg_dYield[i] = -params.dYield[i];
+            plus_sigma[i] = sigma[i] + params.dVol[i];
+            minus_sigma[i] = sigma[i] - params.dVol[i];
+            plusd2Spot[i] = 2 * params.dSpot[i];
+            plusd2Vol[i] = sigma[i] + 2 * params.dVol[i];
+            minusd2Spot[i] = -2 * params.dSpot[i];
+            minusd2Vol[i] = sigma[i] - 2 * params.dVol[i];
+        }
+
         // Base price
-        double basePrice = getCachedPrice(0, 0, 0, 0, 0, sigma);
+        double* basePrice = getCachedPrice(0, 0, 0, 0, 0, sigma, optionType);
         
         // 1st-order Greeks
-        double priceUpS = getCachedPrice(params.dSpot, 0, 0, 0, 0, sigma);
-        double priceDownS = getCachedPrice(-params.dSpot, 0, 0, 0, 0, sigma);
-        greeks["delta"] = (priceUpS - priceDownS) / (2 * params.dSpot);
-        
-        double priceUpSigma = getCachedPrice(0, 0, 0, 0, 0, sigma + params.dVol);
-        double priceDownSigma = getCachedPrice(0, 0, 0, 0, 0, sigma - params.dVol);
-        greeks["vega"] = ((priceUpSigma - priceDownSigma) / (2 * params.dVol))/100;
-        
-        double priceUpT = getCachedPrice(0, 0, 0, 0, params.dTime, sigma);
-        greeks["theta"] = -(priceUpT - basePrice) / params.dTime;
-        
-        double priceUpR = getCachedPrice(0, 0, params.dRate, 0, 0, sigma);
-        greeks["rho"] = ((priceUpR - basePrice) / params.dRate)/100;
-        
-        double priceUpQ = getCachedPrice(0, 0, 0, params.dYield, 0, sigma);
-        greeks["epsilon"] = (priceUpQ - basePrice) / params.dYield;
-        
-        greeks["lambda"] = greeks["delta"] * S / basePrice;
+        double* priceUpS = getCachedPrice(params.dSpot, 0, 0, 0, 0, sigma, optionType);
+        double* priceDownS = getCachedPrice(neg_dSpot, 0, 0, 0, 0, sigma, optionType);
 
-        // 2nd-order Greeks
-        greeks["gamma"] = (priceUpS - 2 * basePrice + priceDownS) / (params.dSpot * params.dSpot);
-        
-        greeks["vanna"] = (getCachedPrice(params.dSpot, 0, 0, 0, 0, sigma + params.dVol) - getCachedPrice(params.dSpot, 0, 0, 0, 0, sigma - params.dVol)
-                        - getCachedPrice(-params.dSpot, 0, 0, 0, 0, sigma + params.dVol) + getCachedPrice(-params.dSpot, 0, 0, 0, 0, sigma - params.dVol)) 
-                        / (4 * params.dSpot * params.dVol);
-        
-        greeks["charm"] = (getCachedPrice(params.dSpot, 0, 0, 0, params.dTime, sigma) - getCachedPrice(params.dSpot, 0, 0, 0, 0, sigma)
-                        - getCachedPrice(-params.dSpot, 0, 0, 0, params.dTime, sigma) + getCachedPrice(-params.dSpot, 0, 0, 0, 0, sigma)) 
-                        / (2 * params.dSpot * params.dTime);
-        
-        greeks["vomma"] = (priceUpSigma - 2 * basePrice + priceDownSigma) / (params.dVol * params.dVol);
-        
-        greeks["veta"] = (getCachedPrice(0, 0, 0, 0, params.dTime, sigma + params.dVol) - getCachedPrice(0, 0, 0, 0, params.dTime, sigma - params.dVol)
-                        - getCachedPrice(0, 0, 0, 0, 0, sigma + params.dVol) + getCachedPrice(0, 0, 0, 0, 0, sigma - params.dVol)) 
-                        / (2 * params.dVol * params.dTime);
+        double* priceUpSigma = getCachedPrice(0, 0, 0, 0, 0, plus_sigma, optionType);
+        double* priceDownSigma = getCachedPrice(0, 0, 0, 0, 0, minus_sigma, optionType);
+        double* priceUpT = getCachedPrice(0, 0, 0, 0, params.dTime, sigma, optionType);
+        double* priceUpR = getCachedPrice(0, 0, params.dRate, 0, 0, sigma, optionType);
+        double* priceUpQ = getCachedPrice(0, 0, 0, params.dYield, 0, sigma, optionType);
 
-        // 3rd-order Greeks
-        double priceUp2S = getCachedPrice(2*params.dSpot, 0, 0, 0, 0, sigma);
-        double priceDown2S = getCachedPrice(-2*params.dSpot, 0, 0, 0, 0, sigma);
-        greeks["speed"] = (priceUp2S - 3*priceUpS + 3*priceDownS - priceDown2S) / (2 * params.dSpot * params.dSpot * params.dSpot);
+        double* upSpotUpVol = getCachedPrice(params.dSpot, 0, 0, 0, 0, plus_sigma, optionType);
+        double* upSpotDownVol = getCachedPrice(params.dSpot, 0, 0, 0, 0, minus_sigma, optionType);
+        double* downSpotUpVol = getCachedPrice(neg_dSpot, 0, 0, 0, 0, plus_sigma, optionType);
+        double* downSpotDownVol = getCachedPrice(neg_dSpot, 0, 0, 0, 0, minus_sigma, optionType);
+        double* upSpotUpTime = getCachedPrice(params.dSpot, 0, 0, 0, params.dTime, sigma, optionType);
+        double* upSpot = getCachedPrice(params.dSpot, 0, 0, 0, 0, sigma, optionType);
+        double* downSpot = getCachedPrice(neg_dSpot, 0, 0, 0, 0, sigma, optionType);
+        double* downSpotUpTime = getCachedPrice(neg_dSpot, 0, 0, 0, params.dTime, sigma, optionType);
+        double* upTimeUpVol = getCachedPrice(0, 0, 0, 0, params.dTime, plus_sigma, optionType);
+        double* upTimeDownVol = getCachedPrice(0, 0, 0, 0, params.dTime, minus_sigma, optionType);
+        double* upVol = getCachedPrice(0, 0, 0, 0, 0, plus_sigma, optionType);
+        double* downVol = getCachedPrice(0, 0, 0, 0, 0, minus_sigma, optionType);
+        double* up2Spot = getCachedPrice(plusd2Spot, 0, 0, 0, 0, sigma, optionType);
+        double* down2Spot = getCachedPrice(minusd2Spot, 0, 0, 0, 0, sigma, optionType);
+        double* up2Vol = getCachedPrice(0, 0, 0, 0, 0, plusd2Vol, optionType);
+        double* down2Vol = getCachedPrice(0, 0, 0, 0, 0, minusd2Vol, optionType);
+        double* upRateUpVol = getCachedPrice(0, 0, params.dRate, 0, 0, plus_sigma, optionType);
+        double* upRateDownVol = getCachedPrice(0, 0, params.dRate, 0, 0, minus_sigma, optionType);
+        double* downRateUpVol = getCachedPrice(0, 0, neg_dRate, 0, 0, plus_sigma, optionType);
+        double* downRateDownVol = getCachedPrice(0, 0, neg_dRate, 0, 0, minus_sigma, optionType);
+            
+        for (int i = 0; i < batch_size; i++) {
+            greeks[i]["iv"] = sigma[i];
+            //First order greek computations
+            greeks[i]["delta"] = (priceUpS[i] - priceDownS[i]) / (2 * params.dSpot[i]);
+            greeks[i]["vega"] = ((priceUpSigma[i] - priceDownSigma[i]) / (2 * params.dVol[i]))/100;
+            greeks[i]["theta"] = -(priceUpT[i] - basePrice[i]) / params.dTime[i];
+            greeks[i]["rho"] = ((priceUpR[i] - basePrice[i]) / params.dRate[i])/100;
+            greeks[i]["veta"] = ((priceUpQ[i] - basePrice[i]) / params.dYield[i])/100;
         
-        greeks["zomma"] = (getCachedPrice(params.dSpot, 0, 0, 0, 0, sigma + params.dVol) - 2*getCachedPrice(0, 0, 0, 0, 0, sigma + params.dVol) + getCachedPrice(-params.dSpot, 0, 0, 0, 0, sigma + params.dVol)
-                        - getCachedPrice(params.dSpot, 0, 0, 0, 0, sigma - params.dVol) + 2*getCachedPrice(0, 0, 0, 0, 0, sigma - params.dVol) - getCachedPrice(-params.dSpot, 0, 0, 0, 0, sigma - params.dVol)) 
-                        / (2 * params.dSpot * params.dSpot * params.dVol);
-        
-        greeks["color"] = (getCachedPrice(params.dSpot, 0, 0, 0, params.dTime, sigma) - 2*getCachedPrice(0, 0, 0, 0, params.dTime, sigma) + getCachedPrice(-params.dSpot, 0, 0, 0, params.dTime, sigma)
-                        - getCachedPrice(params.dSpot, 0, 0, 0, 0, sigma) + 2*basePrice - getCachedPrice(-params.dSpot, 0, 0, 0, 0, sigma)) 
-                        / (params.dSpot * params.dSpot * params.dTime);
-        
-        greeks["ultima"] = ((getCachedPrice(0, 0, 0, 0, 0, sigma + 2*params.dVol) - 3*getCachedPrice(0, 0, 0, 0, 0, sigma + params.dVol) 
-                        + 3*getCachedPrice(0, 0, 0, 0, 0, sigma - params.dVol) - getCachedPrice(0, 0, 0, 0, 0, sigma - 2*params.dVol)) 
-                        / (params.dVol * params.dVol * params.dVol))/(100*100);
+            // Second-order Greeks
+            greeks[i]["gamma"] = (priceUpS[i] - 2 * basePrice[i] + priceDownS[i]) 
+                                / (params.dSpot[i] * params.dSpot[i]);
 
-        // Vera (as requested)
-        double priceUpRSigmaUp = getCachedPrice(0, 0, params.dRate, 0, 0, sigma + params.dVol);
-        double priceUpRSigmaDown = getCachedPrice(0, 0, params.dRate, 0, 0, sigma - params.dVol);
-        double priceDownRSigmaUp = getCachedPrice(0, 0, -params.dRate, 0, 0, sigma + params.dVol);
-        double priceDownRSigmaDown = getCachedPrice(0, 0, -params.dRate, 0, 0, sigma - params.dVol);
-        greeks["vera"] = ((priceUpRSigmaUp - priceUpRSigmaDown) - (priceDownRSigmaUp - priceDownRSigmaDown)) 
-                        / (4 * params.dRate * params.dVol);
+            greeks[i]["vanna"] = (upSpotUpVol[i] - upSpotDownVol[i] - downSpotUpVol[i] + downSpotDownVol[i]) 
+                                / (4 * params.dSpot[i] * params.dVol[i]);
+            
+            greeks[i]["charm"] = (upSpotUpTime[i] - upSpot[i] - downSpotUpTime[i] + downSpot[i]) 
+                                / (2 * params.dSpot[i] * params.dTime[i]);
+            
+            greeks[i]["vomma"] = (upVol[i] - 2 * basePrice[i] + downVol[i]) 
+                                / (params.dVol[i] * params.dVol[i]);
+            
+            greeks[i]["veta"] = (upTimeUpVol[i] - upTimeDownVol[i] - upVol[i] + downVol[i]) 
+                                / (2 * params.dVol[i] * params.dTime[i]);
+            
+            greeks[i]["vera"] = ((upRateUpVol[i] - upRateDownVol[i]) - (downRateUpVol[i] - downRateDownVol[i])) 
+                    / (4 * params.dRate[i] * params.dVol[i]);
 
+
+            // Third-order Greeks
+            greeks[i]["speed"] = (up2Spot[i] - 3*upSpot[i] + 3*downSpot[i] - down2Spot[i]) 
+                                / (2 * params.dSpot[i] * params.dSpot[i] * params.dSpot[i]);
+            
+            greeks[i]["zomma"] = (upSpotUpVol[i] - 2*upVol[i] + downSpotUpVol[i]
+                                - upSpotDownVol[i] + 2*downVol[i] - downSpotDownVol[i]) 
+                                / (2 * params.dSpot[i] * params.dSpot[i] * params.dVol[i]);
+            
+            greeks[i]["color"] = (upSpotUpTime[i] - 2*upTimeUpVol[i] + downSpotUpTime[i]
+                                - upSpot[i] + 2*basePrice[i] - downSpot[i]) 
+                                / (params.dSpot[i] * params.dSpot[i] * params.dTime[i]);
+            
+            greeks[i]["ultima"] = ((up2Vol[i] - 3*upVol[i] + 3*downVol[i] - down2Vol[i]) 
+                                / (params.dVol[i] * params.dVol[i] * params.dVol[i])) / (100*100);
+        }
+        
         return greeks;
     }
 
@@ -262,9 +389,29 @@ public:
         std::cout << "Ultima: " << greeks.at("ultima") << std::endl;
     }
 
-    double computeIV(double optionPrice) {
-        auto f = [this, optionPrice](double sigma) {
-            return getCachedPrice(0, 0, 0, 0, 0, sigma) - optionPrice;
+    void batchedComputeIV() {
+        for (int i = 0; i < batch_size; i++) {
+            sigma[i] = computeIV(i, marketPrices, S, K, r, q, T, optionType);
+        }
+    }
+
+    double computeIV(int index, double* optionPrice, double* d_S, double* d_K, double* d_r, double* d_q, double* d_T, int* d_optionType) {
+        double* price = 0;
+        double* d_price;
+
+        CHECK_CUDA_ERROR(cudaMallocAsync(&d_price, sizeof(double), stream));
+        CHECK_CUDA_ERROR(cudaStreamSynchronize(stream));
+        CHECK_CUDA_ERROR(cudaMemcpyAsync(d_price, price, sizeof(double), cudaMemcpyHostToDevice, stream));
+        CHECK_CUDA_ERROR(cudaStreamSynchronize(stream));
+
+
+
+        auto f = [this, optionPrice, price, d_price, d_S, d_K, d_r, d_q, d_T, d_optionType, index](double sigma) {            
+            calculateSinglePrice<<<1, 1, 0, stream>>>(steps, price, d_S, d_K, d_r, d_q, d_T, d_optionType, sigma, index);
+            CHECK_CUDA_ERROR(cudaStreamSynchronize(stream));
+            CHECK_CUDA_ERROR(cudaMemcpyAsync(price, d_price, sizeof(double), cudaMemcpyDeviceToHost, stream));
+            CHECK_CUDA_ERROR(cudaStreamSynchronize(stream));
+            return *price - optionPrice[index];
         };
         // Initial guess
         double a = 0.1;
@@ -411,54 +558,77 @@ std::vector<OptionData> read_csv(const std::string& filename) {
 
 std::vector<OptionData> processBatch(std::vector<OptionData> batch, cudaStream_t& stream) {
     std::vector<OptionData> results;
-    std::vector<CRROptionPricer> pricers;
-    pricers.reserve(batch.size());
+    double* S = new double[batch.size()];
+    double* K = new double[batch.size()];
+    double* r = new double[batch.size()];
+    double* q = new double[batch.size()];
+    double* T = new double[batch.size()];
+    int* type = new int[batch.size()];
+    double* marketPrices = new double[batch.size()];
     
-    for (auto& option : batch) {
-        double S = option.underlying_price;
-        double K = option.strike_price;
-        double r = option.rfr;
-        double q = 0.0;
-        double T = option.years_to_expiration;
-        int steps = 1000;
-        int type = option.option_type;
-        
-        pricers.emplace_back(S, K, r, q, T, steps, type, .00001, 1000, stream);
-    }
-    
-    for (size_t i = 0; i < batch.size(); ++i) {
-        auto& option = batch[i];
-        auto& pricer = pricers[i];
-        
-        GreekParams params;
-        params.dSpot = 0.01 * option.underlying_price;
-        params.dStrike = 0.01 * option.strike_price;
-        params.dRate = 0.0001;
-        params.dYield = 0.0001;
-        params.dTime = 1.0 / 365.0;
-        params.dVol = 0.01;
-        
-        double iv = pricer.computeIV(option.market_price);
-        std::unordered_map<std::string, double> greeks = pricer.calculateAllGreeks(iv, params);option.impliedVolatility = iv;
+    double* dSpot = new double[batch.size()];
+    double* dStrike = new double[batch.size()];
+    double* dRate = new double[batch.size()];
+    double* dYield = new double[batch.size()];
+    double* dTime = new double[batch.size()];
+    double* dVol = new double[batch.size()];
 
-        option.delta = greeks["delta"];
-        option.gamma = greeks["gamma"];
-        option.theta = greeks["theta"];
-        option.vega = greeks["vega"];
-        option.rho = greeks["rho"];
+    for (int i = 0; i < batch.size(); i++) {
+        S[i] = batch[i].underlying_price;
+        K[i] = batch[i].strike_price;
+        r[i] = batch[i].rfr;
+        q[i] = 0.0;
+        T[i] = batch[i].years_to_expiration;
+        type[i] = batch[i].option_type;
+        marketPrices[i] = batch[i].market_price;
+        dSpot[i] = 0.01 * batch[i].underlying_price;
+        dStrike[i] = 0.01 * batch[i].strike_price;
+        dRate[i] = 0.0001;
+        dYield[i] = 0.0001;
+        dTime[i] = 1.0 / 365.0;
+        dVol[i] = 0.01;
+    }
+        
+
+    GreekParams params;
+    params.dSpot = dSpot;
+    params.dStrike = dStrike;
+    params.dRate = dRate;
+    params.dYield = dYield;
+    params.dTime = dTime;
+    params.dVol = dVol;
+
+    std::unordered_map<std::string, double>* greeks;
+
+    CRROptionPricer pricer(batch.size(), marketPrices, S, K, r, q, T, 1000, type, .00001, 1000, stream);
+    pricer.batchedComputeIV();
+    greeks = pricer.calculateAllGreeks(params);
+
+    for (int i = 0; i < batch.size(); i++) {
+        OptionData option = batch[i];
+        option.impliedVolatility = greeks[i]["iv"];
+        if (option.impliedVolatility < 0) {
+            continue;
+        }
+        option.delta = greeks[i]["delta"];
+        option.theta = greeks[i]["theta"];
+        option.vega = greeks[i]["vega"];
+        option.rho = greeks[i]["rho"];
 
         //second order greeks
-        option.vanna = greeks["vanna"];
-        option.charm = greeks["charm"];
-        option.vomma = greeks["vomma"];
-        option.veta = greeks["veta"];
-        option.vera = greeks["vera"];
+        option.gamma = greeks[i]["gamma"];
+        option.vanna = greeks[i]["vanna"];
+        option.charm = greeks[i]["charm"];
+        option.vomma = greeks[i]["vomma"];
+        option.veta = greeks[i]["veta"];
+        option.vera = greeks[i]["vera"];
 
         //Third order greeks
-        option.speed = greeks["speed"];
-        option.zomma = greeks["zomma"];
-        option.color = greeks["color"];
-        option.ultima = greeks["ultima"];
+        option.speed = greeks[i]["speed"];
+        option.zomma = greeks[i]["zomma"];
+        option.color = greeks[i]["color"];
+        option.ultima = greeks[i]["ultima"];
+
         results.push_back(option);
     }
     return results;
