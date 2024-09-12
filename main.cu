@@ -50,9 +50,9 @@ public:
             );
     };
 
-    std::future<void> enqueue(std::function<void()> task) {
-        std::packaged_task<void()> packaged_task(std::move(task));
-        std::future<void> res = packaged_task.get_future();
+    std::future<std::vector<OptionData>> enqueue(std::function<std::vector<OptionData>()> task) {
+        std::packaged_task<std::vector<OptionData>()> packaged_task(std::move(task));
+        std::future<std::vector<OptionData>> res = packaged_task.get_future();
         {
             std::unique_lock<std::mutex> lock(queue_mutex);
             if(stop)
@@ -482,7 +482,7 @@ std::vector<OptionData> read_csv(const std::string& filename) {
                 //    continue;
                // }
                 options.push_back(option);
-                if (options.size() == 16385) {
+                if (options.size() == 513) {
                     break;
                 }
             } catch (const std::exception& e) {
@@ -499,7 +499,8 @@ std::vector<OptionData> read_csv(const std::string& filename) {
     return options;
 }
 
-void processBatch(std::vector<OptionData>& batch, cudaStream_t& stream) {
+std::vector<OptionData> processBatch(std::vector<OptionData> batch, cudaStream_t& stream, std::mutex& mutex) {
+    std::vector<OptionData> results;
     for (auto& option : batch) {
         double S = option.underlying_price;
         double K = option.strike_price;
@@ -523,7 +524,8 @@ void processBatch(std::vector<OptionData>& batch, cudaStream_t& stream) {
         double iv = pricer.computeIV(option.market_price);
         
         std::unordered_map<std::string, double> greeks = pricer.calculateAllGreeks(iv, params);
-        
+        option.impliedVolatility = iv;
+
         option.delta = greeks["delta"];
         option.gamma = greeks["gamma"];
         option.theta = greeks["theta"];
@@ -542,9 +544,13 @@ void processBatch(std::vector<OptionData>& batch, cudaStream_t& stream) {
         option.zomma = greeks["zomma"];
         option.color = greeks["color"];
         option.ultima = greeks["ultima"];
+        results.push_back(option);
 
     }
-
+    std::lock_guard<std::mutex> lock(mutex);
+    std::cout << batch.size() << " options processed" << std::endl;
+    std::cout << "Batch processed" << std::endl;
+    return results;
 }
 
 int main() {
@@ -562,22 +568,27 @@ int main() {
 
     ThreadPool* pool = new ThreadPool(16);
 
-    std::vector<std::future<void>> futures;
-
+    std::vector<std::future<std::vector<OptionData>>> futures;
+    std::mutex writeMutex;
     for (size_t i = 0; i < options.size(); i += BATCH_SIZE) {
         size_t end = std::min(i + BATCH_SIZE, options.size());
-        i = i >= end ? end-BATCH_SIZE : i; 
+        //i = i >= end ? end-BATCH_SIZE : i; 
         std::cout << "I " << i << " End" << end << std::endl;
         std::vector<OptionData> batch(options.begin() + i, options.begin() + end);
+        std::cout << "Batch size outside pool: " << batch.size() << std::endl;
         //std::cout << "Batch S: " << batch[0].underlying_price << " K: " << batch[0].strike_price << " r: " << batch[0].rfr << " T: " << batch[0].years_to_expiration << std::endl;
-        futures.push_back(pool->enqueue([&batch, &streams, i, NUM_STREAMS]() {
-            processBatch(batch, streams[i / BATCH_SIZE % NUM_STREAMS]);
+        futures.push_back(pool->enqueue([batch, &streams, i, NUM_STREAMS, &writeMutex]()->std::vector<OptionData> {
+            return processBatch(batch, streams[i / BATCH_SIZE % NUM_STREAMS], writeMutex);
         }));
     }
     std::cout << "Queue created" << std::endl;
     // Collect results in order
+    std::vector<std::vector<OptionData>> results;
     for (size_t i = 0; i < futures.size(); ++i) {
         futures[i].wait();
+    }
+    for (size_t i = 0; i < futures.size(); ++i) {
+        results.push_back(futures[i].get());
     }
 
     // Clean up CUDA streams
