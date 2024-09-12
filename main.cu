@@ -125,6 +125,8 @@ private:
     double S, K, r, q, T, tol;
     int steps, max_iter, optionType;
     cudaStream_t stream;
+    double *d_prices, *d_values;
+
 
     struct PriceCache {
         double price;
@@ -159,46 +161,40 @@ public:
         priceCache.emplace_back(price, currentS, currentK, currentR, currentQ, currentT, currentSigma);
         return price;
     }
+
     double calculatePrice(double S, double K, double r, double q, double T, double sigma) {
         double dt = T / steps;
         double u = std::exp(sigma * std::sqrt(dt));
         double d = 1.0 / u;
         double p = (std::exp((r - q) * dt) - d) / (u - d);
 
-        double* d_prices;
-        double* d_values;
-
-        CHECK_CUDA_ERROR(cudaMallocAsync(&d_prices, (steps + 1) * sizeof(double), stream));
-        CHECK_CUDA_ERROR(cudaMallocAsync(&d_values, (steps + 1) * sizeof(double), stream));
-
         int block_size = 256;
         int grid_size = (steps + block_size - 1) / block_size;
 
         initializeAssetPrices<<<grid_size, block_size, 0, stream>>>(d_prices, d_values, S, K, u, d, steps, optionType);
-        CHECK_CUDA_ERROR(cudaStreamSynchronize(stream));
 
         for (int i = steps - 1; i >= 0; i--) {
             backwardInduction<<<grid_size, block_size, 0, stream>>>(d_values, d_prices, i, S, K, p, r, dt, u, d, optionType);
-            CHECK_CUDA_ERROR(cudaStreamSynchronize(stream));    
         }   
 
         double result;
         CHECK_CUDA_ERROR(cudaMemcpyAsync(&result, d_values, sizeof(double), cudaMemcpyDeviceToHost, stream));
-        CHECK_CUDA_ERROR(cudaStreamSynchronize(stream));
-        try {
-            CHECK_CUDA_ERROR(cudaFreeAsync(d_prices, stream));
-            CHECK_CUDA_ERROR(cudaFreeAsync(d_values, stream));
-        }
-        catch (const std::exception& e) {
-            std::cerr << "Error freeing memory: " << e.what() << std::endl;
-        }
-        CHECK_CUDA_ERROR(cudaStreamSynchronize(stream));
+        
         return result;
     }
 
     CRROptionPricer(double S, double K, double r, double q, double T, int steps, int type, double tol, int max_iter, cudaStream_t stream)
-        : S(S), K(K), r(r), q(q), T(T), steps(steps), optionType(type), tol(tol), max_iter(max_iter), stream(stream) {}
-
+        : S(S), K(K), r(r), q(q), T(T), steps(steps), optionType(type), tol(tol), max_iter(max_iter), stream(stream) {
+        // Allocate device memory
+        CHECK_CUDA_ERROR(cudaMallocAsync(&d_prices, (steps + 1) * sizeof(double), stream));
+        CHECK_CUDA_ERROR(cudaMallocAsync(&d_values, (steps + 1) * sizeof(double), stream));
+    }
+    
+    ~CRROptionPricer() {
+        // Free device memory
+        CHECK_CUDA_ERROR(cudaFreeAsync(d_prices, stream));
+        CHECK_CUDA_ERROR(cudaFreeAsync(d_values, stream));
+    }
 
     std::unordered_map<std::string, double> calculateAllGreeks(double sigma, const GreekParams& params) {
         std::unordered_map<std::string, double> greeks;
@@ -267,65 +263,6 @@ public:
         double priceDownRSigmaDown = getCachedPrice(0, 0, -params.dRate, 0, 0, sigma - params.dVol);
         greeks["vera"] = ((priceUpRSigmaUp - priceUpRSigmaDown) - (priceDownRSigmaUp - priceDownRSigmaDown)) 
                         / (4 * params.dRate * params.dVol);
-
-        return greeks;
-    }
-
-    std::unordered_map<std::string, double> calculateAllGreeksOld(double sigma, double h = 1.0) {
-        std::unordered_map<std::string, double> greeks;
-        
-        // Base price
-        double basePrice = getCachedPrice(0, 0, 0, 0, 0, sigma);
-        
-        // Delta (for $1 move in underlying)
-        double priceUpS = getCachedPrice(h, 0, 0, 0, 0, sigma);
-        double priceDownS = getCachedPrice(-h, 0, 0, 0, 0, sigma);
-        greeks["delta"] = (priceUpS - priceDownS) / (2 * h);
-        
-        // Gamma (for $1 move in underlying)
-        greeks["gamma"] = (priceUpS - 2 * basePrice + priceDownS) / (h * h);
-        
-        // Theta (for 1 day)
-        double priceUpT = getCachedPrice(0, 0, 0, 0, 1.0/365.0, sigma);
-        greeks["theta"] = -(priceUpT - basePrice) / (1.0/365.0);
-        
-        // Vega (for 1% change in volatility)
-        double priceUpSigma = getCachedPrice(0, 0, 0, 0, 0, sigma + 0.01);
-        greeks["vega"] = (priceUpSigma - basePrice);
-        
-        // Rho (for 1% change in interest rate)
-        double priceUpR = getCachedPrice(0, 0, 0.01, 0, 0, sigma);
-        greeks["rho"] = (priceUpR - basePrice);
-        
-        // Higher order Greeks
-        greeks["vanna"] = (getCachedPrice(h, 0, 0, 0, 0, sigma + 0.01) - getCachedPrice(h, 0, 0, 0, 0, sigma - 0.01)
-                        - getCachedPrice(-h, 0, 0, 0, 0, sigma + 0.01) + getCachedPrice(-h, 0, 0, 0, 0, sigma - 0.01)) / (4 * h * 0.02);
-        
-        greeks["charm"] = (getCachedPrice(h, 0, 0, 0, 1.0/365.0, sigma) - getCachedPrice(h, 0, 0, 0, 0, sigma)
-                        - getCachedPrice(-h, 0, 0, 0, 1.0/365.0, sigma) + getCachedPrice(-h, 0, 0, 0, 0, sigma)) / (2 * h * 1.0/365.0);
-        
-        greeks["vomma"] = (priceUpSigma - 2 * basePrice + getCachedPrice(0, 0, 0, 0, 0, sigma - 0.01));
-
-        greeks["veta"] = (getCachedPrice(0, 0, 0, 0, 1.0/365.0, sigma + 0.01) - 2*basePrice + getCachedPrice(0, 0, 0, 0, 1.0/365.0, sigma - 0.01));
-
-
-        
-        // Speed
-        double priceUp2S = getCachedPrice(2*h, 0, 0, 0, 0, sigma);
-        double priceDown2S = getCachedPrice(-2*h, 0, 0, 0, 0, sigma);
-        greeks["speed"] = (priceUp2S - 3*priceUpS + 3*priceDownS - priceDown2S) / (2 * h * h * h);
-        
-        // Zomma
-        greeks["zomma"] = (getCachedPrice(h, 0, 0, 0, 0, sigma + 0.01) - 2*getCachedPrice(0, 0, 0, 0, 0, sigma + 0.01) + getCachedPrice(-h, 0, 0, 0, 0, sigma + 0.01)
-                        - getCachedPrice(h, 0, 0, 0, 0, sigma - 0.01) + 2*getCachedPrice(0, 0, 0, 0, 0, sigma - 0.01) - getCachedPrice(-h, 0, 0, 0, 0, sigma - 0.01)) / (2 * h * h * 0.02);
-        
-        // Color
-        greeks["color"] = (getCachedPrice(h, 0, 0, 0, 1.0/365.0, sigma) - 2*getCachedPrice(0, 0, 0, 0, 1.0/365.0, sigma) + getCachedPrice(-h, 0, 0, 0, 1.0/365.0, sigma)
-                        - getCachedPrice(h, 0, 0, 0, 0, sigma) + 2*basePrice - getCachedPrice(-h, 0, 0, 0, 0, sigma)) / (h * h * 1.0/365.0);
-        
-        // Ultima
-        greeks["ultima"] = (getCachedPrice(0, 0, 0, 0, 0, sigma + 0.02) - 3*getCachedPrice(0, 0, 0, 0, 0, sigma + 0.01) 
-                        + 3*getCachedPrice(0, 0, 0, 0, 0, sigma - 0.01) - getCachedPrice(0, 0, 0, 0, 0, sigma - 0.02));
 
         return greeks;
     }
@@ -501,6 +438,9 @@ std::vector<OptionData> read_csv(const std::string& filename) {
 
 std::vector<OptionData> processBatch(std::vector<OptionData> batch, cudaStream_t& stream) {
     std::vector<OptionData> results;
+    std::vector<CRROptionPricer> pricers;
+    pricers.reserve(batch.size());
+    
     for (auto& option : batch) {
         double S = option.underlying_price;
         double K = option.strike_price;
@@ -508,23 +448,25 @@ std::vector<OptionData> processBatch(std::vector<OptionData> batch, cudaStream_t
         double q = 0.0;
         double T = option.years_to_expiration;
         int steps = 1000;
-        //std::cout << "S: " << S << " K: " << K << " r: " << r << " T: " << T << std::endl;
         int type = option.option_type;
-        //int type = (option.option_type == "call") ? 0 : 1;
+        
+        pricers.emplace_back(S, K, r, q, T, steps, type, .00001, 1000, stream);
+    }
+    
+    for (size_t i = 0; i < batch.size(); ++i) {
+        auto& option = batch[i];
+        auto& pricer = pricers[i];
+        
         GreekParams params;
-        params.dSpot = 0.01 * S;
-        params.dStrike = 0.01 * K;
+        params.dSpot = 0.01 * option.underlying_price;
+        params.dStrike = 0.01 * option.strike_price;
         params.dRate = 0.0001;
         params.dYield = 0.0001;
         params.dTime = 1.0 / 365.0;
         params.dVol = 0.01;
         
-        CRROptionPricer pricer(S, K, r, q, T, steps, type, .00001, 1000, stream);
-        
         double iv = pricer.computeIV(option.market_price);
-        
-        std::unordered_map<std::string, double> greeks = pricer.calculateAllGreeks(iv, params);
-        option.impliedVolatility = iv;
+        std::unordered_map<std::string, double> greeks = pricer.calculateAllGreeks(iv, params);option.impliedVolatility = iv;
 
         option.delta = greeks["delta"];
         option.gamma = greeks["gamma"];
@@ -545,7 +487,6 @@ std::vector<OptionData> processBatch(std::vector<OptionData> batch, cudaStream_t
         option.color = greeks["color"];
         option.ultima = greeks["ultima"];
         results.push_back(option);
-
     }
     return results;
 }
@@ -558,7 +499,7 @@ int main() {
     const int NUM_STREAMS = 16; // Adjust based on your GPU capabilities
     std::vector<cudaStream_t> streams(NUM_STREAMS);
     for (int i = 0; i < NUM_STREAMS; ++i) {
-        CHECK_CUDA_ERROR(cudaStreamCreate(&streams[i]));
+        CHECK_CUDA_ERROR(cudaStreamCreateWithFlags(&streams[i], cudaStreamNonBlocking));
     }
 
     const int BATCH_SIZE = 64;
@@ -599,6 +540,8 @@ int main() {
     for (int i = 0; i < NUM_STREAMS; ++i) {
         CHECK_CUDA_ERROR(cudaStreamDestroy(streams[i]));
     }
+
+    exit(1094782);
 
     // Print or save results
     for (const auto& result : final_results) {
