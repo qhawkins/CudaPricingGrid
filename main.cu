@@ -482,7 +482,7 @@ std::vector<OptionData> read_csv(const std::string& filename) {
                 //    continue;
                // }
                 options.push_back(option);
-                if (options.size() == 130) {
+                if (options.size() == 1024) {
                     break;
                 }
             } catch (const std::exception& e) {
@@ -578,6 +578,7 @@ int main() {
     std::cout << "Queue created" << std::endl;
     // Collect results in order
     std::vector<std::vector<OptionData>> results;
+    auto start = std::chrono::high_resolution_clock::now();
     for (size_t i = 0; i < futures.size(); ++i) {
         futures[i].wait();
     }
@@ -590,6 +591,9 @@ int main() {
             final_results.push_back(option);
         }
     }
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> elapsed = end - start;
+    std::cout << "Elapsed time: " << elapsed.count() << "s" << std::endl;
 
     // Clean up CUDA streams
     for (int i = 0; i < NUM_STREAMS; ++i) {
