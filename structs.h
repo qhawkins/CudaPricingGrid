@@ -17,7 +17,7 @@ struct OptionData {
     float underlying_price;
     float years_to_expiration;
     float rfr;
-    std::string option_type;
+    int option_type;
     std::string contract_id;
     std::string timestamp;
     // First-order Greeks
