@@ -96,11 +96,14 @@ struct GreekParams {
 class CRROptionPricer {
 private:
     double *S, *K, *r, *q, *T, tol, *marketPrices;
+    double *d_S, *d_K, *d_r, *d_q, *d_T;
+    int *d_optionType;
     int steps, max_iter, *optionType;
     cudaStream_t stream;
     double *d_prices, *d_values;
     int batch_size;
     double *sigma;
+    double* batched_sigmas = new double[batch_size];
 
 
     struct PriceCache {
@@ -113,64 +116,55 @@ private:
     std::vector<PriceCache> priceCache;
 
 public:
-    double* getCachedPrice(double* shiftS, double* shiftK, double* shiftR, double* shiftQ, double* shiftT, double* shiftSigma, int* optionType) {
-        double* currentS;
-        double* currentK;
-        double* currentR;
-        double* currentQ;
-        double* currentT;
-        double* currentSigma;
-        double* price;
-        int* type;
+    double* getCachedPrice(double shiftS, double shiftK, double shiftR, double shiftQ, double shiftT, double shiftSigma, int optionType) {
+        double currentS;
+        double currentK;
+        double currentR;
+        double currentQ;
+        double currentT;
+        double currentSigma;
+        double price;
+        int type;
 
-        for (int i = 0; i < batch_size; i++) {
-            currentS[i] = S[i] + shiftS[i];
-            currentK[i] = K[i] + shiftK[i];
-            currentR[i] = r[i] + shiftR[i];
-            currentQ[i] = q[i] + shiftQ[i];
-            currentT[i] = T[i] + shiftT[i];
+        currentS = *S + shiftS;
+        currentK = *K + shiftK;
+        currentR = *r + shiftR;
+        currentQ = *q + shiftQ;
+        currentT = *T + shiftT;
 
             // Update sigma, currently array, may need to be changed
-            currentSigma[i] = shiftSigma[i];
+        currentSigma = shiftSigma;
 
 
-            price[i] = 0;
-            type[i] = optionType[i];
-        }
+        price = 0;
+        type = optionType;
+        
 
-        double* to_calc_S;
-        double* to_calc_K;
-        double* to_calc_R;
-        double* to_calc_Q;
-        double* to_calc_T;
-        double* to_calc_Sigma;
-        double** to_calc_Price;
-        int* to_calc_Type;
+        double to_calc_S;
+        double to_calc_K;
+        double to_calc_R;
+        double to_calc_Q;
+        double to_calc_T;
+        double to_calc_Sigma;
+        double to_calc_Price;
+        int to_calc_Type;
     
         int index = 0;
 
         // Check if price is already cached
         for (auto& cache : priceCache) {
-            for (int i = 0; i < batch_size; i++) {
-                if (std::abs(cache.S[i] - currentS[i]) > 1e-10 &&
-                    std::abs(cache.K[i] - currentK[i]) > 1e-10 &&
-                    std::abs(cache.r[i] - currentR[i]) > 1e-10 &&
-                    std::abs(cache.q[i] - currentQ[i]) > 1e-10 &&
-                    std::abs(cache.T[i] - currentT[i]) > 1e-10 &&
-                    std::abs(cache.sigma[i] - currentSigma[i]) > 1e-10) {
-                    
-                        to_calc_S[index] = currentS[i];
-                        to_calc_K[index] = currentK[i];
-                        to_calc_R[index] = currentR[i];
-                        to_calc_Q[index] = currentQ[i];
-                        to_calc_T[index] = currentT[i];
-                        to_calc_Sigma[index] = currentSigma[i];
-                        to_calc_Price[index] = &price[i];
-                        to_calc_Type[index] = type[i];
-                        index++;
-                }
+            if (std::abs(cache.S - currentS) > 1e-10 &&
+                std::abs(cache.K - currentK) > 1e-10 &&
+                std::abs(cache.r - currentR) > 1e-10 &&
+                std::abs(cache.q - currentQ) > 1e-10 &&
+                std::abs(cache.T - currentT) > 1e-10 &&
+                std::abs(cache.sigma - currentSigma) > 1e-10) {
+                
+
+                    index++;
             }
         }
+        
         int blockSize = 256;
         int numBlocks = (index + blockSize - 1) / blockSize;
 
@@ -225,9 +219,6 @@ public:
     CRROptionPricer(int batch_size, double* marketPrices, double* S, double* K, double* r, double* q, double* T, int steps, int* type, double tol, int max_iter, cudaStream_t stream)
         : S(S), K(K), r(r), q(q), T(T), steps(steps), optionType(type), tol(tol), max_iter(max_iter), stream(stream), batch_size(batch_size), marketPrices(marketPrices) {
         // Allocate device memory
-        double *d_S, *d_K, *d_r, *d_q, *d_T;
-        int *d_optionType;
-    
         CHECK_CUDA_ERROR(cudaMallocAsync(&d_prices, (steps + 1) * sizeof(double), stream));
         CHECK_CUDA_ERROR(cudaMallocAsync(&d_values, (steps + 1) * sizeof(double), stream));
         CHECK_CUDA_ERROR(cudaMallocAsync(&d_S, batch_size * sizeof(double), stream));
@@ -244,7 +235,7 @@ public:
         CHECK_CUDA_ERROR(cudaMemcpyAsync(d_r, r, batch_size * sizeof(double), cudaMemcpyHostToDevice, stream));
         CHECK_CUDA_ERROR(cudaMemcpyAsync(d_q, q, batch_size * sizeof(double), cudaMemcpyHostToDevice, stream));
         CHECK_CUDA_ERROR(cudaMemcpyAsync(d_T, T, batch_size * sizeof(double), cudaMemcpyHostToDevice, stream));
-        CHECK_CUDA_ERROR(cudaMemcpyAsync(d_optionType, type, batch_size * sizeof(int), cudaMemcpyHostToDevice, stream));
+        CHECK_CUDA_ERROR(cudaMemcpyAsync(d_optionType, optionType, batch_size * sizeof(int), cudaMemcpyHostToDevice, stream));
         
         CHECK_CUDA_ERROR(cudaStreamSynchronize(stream));
     }
@@ -253,22 +244,29 @@ public:
         // Free device memory
         CHECK_CUDA_ERROR(cudaFreeAsync(d_prices, stream));
         CHECK_CUDA_ERROR(cudaFreeAsync(d_values, stream));
+        CHECK_CUDA_ERROR(cudaFreeAsync(d_S, stream));
+        CHECK_CUDA_ERROR(cudaFreeAsync(d_K, stream));
+        CHECK_CUDA_ERROR(cudaFreeAsync(d_r, stream));
+        CHECK_CUDA_ERROR(cudaFreeAsync(d_q, stream));
+        CHECK_CUDA_ERROR(cudaFreeAsync(d_T, stream));
+        CHECK_CUDA_ERROR(cudaFreeAsync(d_optionType, stream));
+        CHECK_CUDA_ERROR(cudaStreamSynchronize(stream));
     }
 
     std::unordered_map<std::string, double>* calculateAllGreeks(const GreekParams& params) {
         std::unordered_map<std::string, double>* greeks;
         
-        double* neg_dSpot;
-        double* neg_dVol;
-        double* neg_dTime;
-        double* neg_dRate;
-        double* neg_dYield;
-        double* plus_sigma;
-        double* minus_sigma;
-        double* plusd2Spot;
-        double* plusd2Vol;
-        double* minusd2Spot;
-        double* minusd2Vol;
+        double* neg_dSpot = new double[batch_size];
+        double* neg_dVol = new double[batch_size];
+        double* neg_dTime = new double[batch_size];
+        double* neg_dRate = new double[batch_size];
+        double* neg_dYield = new double[batch_size];
+        double* plus_sigma = new double[batch_size];
+        double* minus_sigma = new double[batch_size];
+        double* plusd2Spot = new double[batch_size];
+        double* plusd2Vol = new double[batch_size];
+        double* minusd2Spot = new double[batch_size];
+        double* minusd2Vol = new double[batch_size];
 
 
         for (int i = 0; i < batch_size; i++) {
@@ -277,41 +275,41 @@ public:
             neg_dTime[i] = -params.dTime[i];
             neg_dRate[i] = -params.dRate[i];
             neg_dYield[i] = -params.dYield[i];
-            plus_sigma[i] = sigma[i] + params.dVol[i];
-            minus_sigma[i] = sigma[i] - params.dVol[i];
+            plus_sigma[i] = batched_sigmas[i] + params.dVol[i];
+            minus_sigma[i] = batched_sigmas[i] - params.dVol[i];
             plusd2Spot[i] = 2 * params.dSpot[i];
-            plusd2Vol[i] = sigma[i] + 2 * params.dVol[i];
+            plusd2Vol[i] = batched_sigmas[i] + 2 * params.dVol[i];
             minusd2Spot[i] = -2 * params.dSpot[i];
-            minusd2Vol[i] = sigma[i] - 2 * params.dVol[i];
+            minusd2Vol[i] = batched_sigmas[i] - 2 * params.dVol[i];
         }
 
         // Base price
-        double* basePrice = getCachedPrice(0, 0, 0, 0, 0, sigma, optionType);
+        double* basePrice = getCachedPrice(0, 0, 0, 0, 0, batched_sigmas, optionType);
         
         // 1st-order Greeks
-        double* priceUpS = getCachedPrice(params.dSpot, 0, 0, 0, 0, sigma, optionType);
-        double* priceDownS = getCachedPrice(neg_dSpot, 0, 0, 0, 0, sigma, optionType);
+        double* priceUpS = getCachedPrice(params.dSpot, 0, 0, 0, 0, batched_sigmas, optionType);
+        double* priceDownS = getCachedPrice(neg_dSpot, 0, 0, 0, 0, batched_sigmas, optionType);
 
         double* priceUpSigma = getCachedPrice(0, 0, 0, 0, 0, plus_sigma, optionType);
         double* priceDownSigma = getCachedPrice(0, 0, 0, 0, 0, minus_sigma, optionType);
-        double* priceUpT = getCachedPrice(0, 0, 0, 0, params.dTime, sigma, optionType);
-        double* priceUpR = getCachedPrice(0, 0, params.dRate, 0, 0, sigma, optionType);
-        double* priceUpQ = getCachedPrice(0, 0, 0, params.dYield, 0, sigma, optionType);
+        double* priceUpT = getCachedPrice(0, 0, 0, 0, params.dTime, batched_sigmas, optionType);
+        double* priceUpR = getCachedPrice(0, 0, params.dRate, 0, 0, batched_sigmas, optionType);
+        double* priceUpQ = getCachedPrice(0, 0, 0, params.dYield, 0, batched_sigmas, optionType);
 
         double* upSpotUpVol = getCachedPrice(params.dSpot, 0, 0, 0, 0, plus_sigma, optionType);
         double* upSpotDownVol = getCachedPrice(params.dSpot, 0, 0, 0, 0, minus_sigma, optionType);
         double* downSpotUpVol = getCachedPrice(neg_dSpot, 0, 0, 0, 0, plus_sigma, optionType);
         double* downSpotDownVol = getCachedPrice(neg_dSpot, 0, 0, 0, 0, minus_sigma, optionType);
-        double* upSpotUpTime = getCachedPrice(params.dSpot, 0, 0, 0, params.dTime, sigma, optionType);
-        double* upSpot = getCachedPrice(params.dSpot, 0, 0, 0, 0, sigma, optionType);
-        double* downSpot = getCachedPrice(neg_dSpot, 0, 0, 0, 0, sigma, optionType);
-        double* downSpotUpTime = getCachedPrice(neg_dSpot, 0, 0, 0, params.dTime, sigma, optionType);
+        double* upSpotUpTime = getCachedPrice(params.dSpot, 0, 0, 0, params.dTime, batched_sigmas, optionType);
+        double* upSpot = getCachedPrice(params.dSpot, 0, 0, 0, 0, batched_sigmas, optionType);
+        double* downSpot = getCachedPrice(neg_dSpot, 0, 0, 0, 0, batched_sigmas, optionType);
+        double* downSpotUpTime = getCachedPrice(neg_dSpot, 0, 0, 0, params.dTime, batched_sigmas, optionType);
         double* upTimeUpVol = getCachedPrice(0, 0, 0, 0, params.dTime, plus_sigma, optionType);
         double* upTimeDownVol = getCachedPrice(0, 0, 0, 0, params.dTime, minus_sigma, optionType);
         double* upVol = getCachedPrice(0, 0, 0, 0, 0, plus_sigma, optionType);
         double* downVol = getCachedPrice(0, 0, 0, 0, 0, minus_sigma, optionType);
-        double* up2Spot = getCachedPrice(plusd2Spot, 0, 0, 0, 0, sigma, optionType);
-        double* down2Spot = getCachedPrice(minusd2Spot, 0, 0, 0, 0, sigma, optionType);
+        double* up2Spot = getCachedPrice(plusd2Spot, 0, 0, 0, 0, batched_sigmas, optionType);
+        double* down2Spot = getCachedPrice(minusd2Spot, 0, 0, 0, 0, batched_sigmas, optionType);
         double* up2Vol = getCachedPrice(0, 0, 0, 0, 0, plusd2Vol, optionType);
         double* down2Vol = getCachedPrice(0, 0, 0, 0, 0, minusd2Vol, optionType);
         double* upRateUpVol = getCachedPrice(0, 0, params.dRate, 0, 0, plus_sigma, optionType);
@@ -391,27 +389,27 @@ public:
 
     void batchedComputeIV() {
         for (int i = 0; i < batch_size; i++) {
-            sigma[i] = computeIV(i, marketPrices, S, K, r, q, T, optionType);
+            batched_sigmas[i] = computeIV(i, marketPrices);
         }
     }
 
-    double computeIV(int index, double* optionPrice, double* d_S, double* d_K, double* d_r, double* d_q, double* d_T, int* d_optionType) {
-        double* price = 0;
+    double computeIV(int index, double* optionPrice) {
         double* d_price;
 
         CHECK_CUDA_ERROR(cudaMallocAsync(&d_price, sizeof(double), stream));
         CHECK_CUDA_ERROR(cudaStreamSynchronize(stream));
-        CHECK_CUDA_ERROR(cudaMemcpyAsync(d_price, price, sizeof(double), cudaMemcpyHostToDevice, stream));
-        CHECK_CUDA_ERROR(cudaStreamSynchronize(stream));
-
-
-
-        auto f = [this, optionPrice, price, d_price, d_S, d_K, d_r, d_q, d_T, d_optionType, index](double sigma) {            
-            calculateSinglePrice<<<1, 1, 0, stream>>>(steps, price, d_S, d_K, d_r, d_q, d_T, d_optionType, sigma, index);
+        
+        auto f = [this, &optionPrice, &d_price, index](double sigma) {            
+            double price = 0;
+            //CHECK_CUDA_ERROR(cudaMemcpyAsync(d_price, &optionPrice[index], sizeof(double), cudaMemcpyHostToDevice, stream));
+            //CHECK_CUDA_ERROR(cudaStreamSynchronize(stream));
+            int shared_mem = (steps + 1) * sizeof(double)*2;
+            calculateSinglePrice<<<1, 1, shared_mem, stream>>>(steps, d_price, this->d_S, this->d_K, this->d_r, this->d_q, this->d_T, this->d_optionType, sigma, index);
             CHECK_CUDA_ERROR(cudaStreamSynchronize(stream));
-            CHECK_CUDA_ERROR(cudaMemcpyAsync(price, d_price, sizeof(double), cudaMemcpyDeviceToHost, stream));
+            CHECK_CUDA_ERROR(cudaMemcpyAsync(&price, d_price, sizeof(double), cudaMemcpyDeviceToHost, stream));
             CHECK_CUDA_ERROR(cudaStreamSynchronize(stream));
-            return *price - optionPrice[index];
+            //std::cout << "Price: " << price << std::endl;
+            return price - optionPrice[index];
         };
         // Initial guess
         double a = 0.1;
@@ -434,6 +432,7 @@ public:
         }
 
         if (fa * fb > 0) {
+            CHECK_CUDA_ERROR(cudaFreeAsync(d_price, stream));
             return -1;  // Root not bracketed after attempts
         }
 
@@ -455,6 +454,7 @@ public:
             double xm = 0.5 * (c - b);
             
             if (std::abs(xm) <= tol1 || fb == 0) {
+                CHECK_CUDA_ERROR(cudaFreeAsync(d_price, stream));
                 return b;  // Found a solution
             }
             
@@ -490,7 +490,7 @@ public:
             b += (std::abs(d) > tol1) ? d : (xm > 0 ? tol1 : -tol1);
             fb = f(b);
         }
-
+        CHECK_CUDA_ERROR(cudaFreeAsync(d_price, stream));
         return -2;  // Max iterations reached
     }
 };
@@ -645,7 +645,7 @@ int main() {
         CHECK_CUDA_ERROR(cudaStreamCreateWithFlags(&streams[i], cudaStreamNonBlocking));
     }
 
-    const int BATCH_SIZE = 64;
+    const int BATCH_SIZE = NUM_STREAMS;
 
     ThreadPool* pool = new ThreadPool(16);
 
