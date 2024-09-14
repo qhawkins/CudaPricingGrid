@@ -85,7 +85,9 @@ __global__ void priceOptionsKernel(int steps, int batchSize,
                                    double* q, double* T, double* sigma, 
                                    int* optionType, double* prices) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
-    if (idx >= batchSize) return;
+    if (idx >= batchSize){
+        return;
+    } 
 
     prices[idx] = deviceOptionPrice(steps, S[idx], K[idx], r[idx], q[idx], T[idx], sigma[idx], optionType[idx]);
 }

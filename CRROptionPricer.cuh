@@ -142,21 +142,32 @@ public:
     std::vector<Greeks> calculateAllGreeks(const GreekParams& params, const std::vector<double>& sigma) {
         std::vector<Greeks> greeks(batch_size, Greeks());
 
+        double *d_greek_prices;
+        double *d_sigma;
+        CHECK_CUDA_ERROR(cudaMallocAsync(&d_greek_prices, batch_size * sizeof(double), stream));
+        CHECK_CUDA_ERROR(cudaMallocAsync(&d_sigma, batch_size * sizeof(double), stream));
+
+        // Copy sigma to device
+        CHECK_CUDA_ERROR(cudaMemcpyAsync(d_sigma, sigma.data(), 
+                                        batch_size * sizeof(double), 
+                                        cudaMemcpyHostToDevice, stream));
+
         // Step 1: Price Original Options
         // Launch pricing kernel for original options
         priceOptionsKernel<<<(batch_size + 255) / 256, 256, 0, stream>>>(
             steps, batch_size, d_S, d_K, d_r, d_q, d_T, 
-            const_cast<double*>(sigma.data()), d_optionType, d_prices
+            d_sigma, d_optionType, d_greek_prices
         );
         CHECK_CUDA_ERROR(cudaGetLastError());
 
         // Copy original prices back to host
         std::vector<double> price_original(batch_size);
-        std::cout << "batch size: " << batch_size << std::endl;
-        CHECK_CUDA_ERROR(cudaMemcpyAsync(price_original.data(), d_prices, 
+        //std::cout << "batch size: " << batch_size << std::endl;
+        CHECK_CUDA_ERROR(cudaMemcpyAsync(price_original.data(), d_greek_prices, 
                                         batch_size * sizeof(double), 
                                         cudaMemcpyDeviceToHost, stream));
         CHECK_CUDA_ERROR(cudaStreamSynchronize(stream));
+        //std::cout << "Original Prices: " << price_original[0] << std::endl;
 
         // Step 2: Prepare Shifted Parameters
         std::vector<double> shifted_S_up(batch_size);
@@ -307,6 +318,8 @@ public:
         cudaFree(d_shifted_q_total);
         cudaFree(d_shifted_T_total);
         cudaFree(d_shifted_prices_total);
+        cudaFree(d_greek_prices);
+        cudaFree(d_sigma);
         
         return greeks;
     }

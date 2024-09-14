@@ -13,73 +13,22 @@
 #include <condition_variable>
 #include <functional>
 #include <future>
-
 #include "structs.h"
 #include "kernels.cuh"
 #include "CRROptionPricer.cuh"
+#include "concurrent_queue.h"
+#include "threadpool.h"
 
-
-class ThreadPool {
-public:
-    ThreadPool(size_t threads) : stop(false) {
-        for(size_t i = 0; i < threads; ++i)
-            workers.emplace_back(
-                [this]
-                {
-                    for(;;)
-                    {
-                        std::packaged_task<void()> task;
-                        {
-                            std::unique_lock<std::mutex> lock(this->queue_mutex);
-                            this->condition.wait(lock,
-                                [this]{ return this->stop || !this->tasks.empty(); });
-                            if(this->stop && this->tasks.empty())
-                                return;
-                            task = std::move(this->tasks.front());
-                            this->tasks.pop();
-                        }
-                        task();
-                    }
-                }
-            );
-    };
-
-    std::future<std::vector<OptionData>> enqueue(std::function<std::vector<OptionData>()> task) {
-        std::packaged_task<std::vector<OptionData>()> packaged_task(std::move(task));
-        std::future<std::vector<OptionData>> res = packaged_task.get_future();
-        {
-            std::unique_lock<std::mutex> lock(queue_mutex);
-            if(stop)
-                throw std::runtime_error("enqueue on stopped ThreadPool");
-            tasks.emplace(std::move(packaged_task));
-        }
-        condition.notify_one();
-        return res;
-    };
-
-    ~ThreadPool() {
-        {
-            std::unique_lock<std::mutex> lock(queue_mutex);
-            stop = true;
-        }
-        condition.notify_all();
-        for(std::thread &worker: workers)
-            worker.join();
-    };
-
-private:
-    std::vector<std::thread> workers;
-    std::queue<std::packaged_task<void()>> tasks;
-    
-    std::mutex queue_mutex;
-    std::condition_variable condition;
-    bool stop;
+struct BatchResult {
+    std::vector<OptionData> data;
+    bool is_sentinel;
 };
 
 // Function to process a single batch
-std::vector<OptionData> processBatch(const std::vector<OptionData>& batch, 
-                                     cudaStream_t& stream) 
+std::vector<OptionData> processBatch(const std::vector<OptionData>& batch) 
 {
+    cudaStream_t stream;
+    CHECK_CUDA_ERROR(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
     int batch_size = batch.size();
     std::vector<double> S(batch_size);
     std::vector<double> K(batch_size);
@@ -108,12 +57,12 @@ std::vector<OptionData> processBatch(const std::vector<OptionData>& batch,
     }
 
     // Initialize pricer
-    CRROptionPricer pricer(batch_size, marketPrices.data(), S.data(), K.data(), 
+    CRROptionPricer* pricer = new CRROptionPricer(batch_size, marketPrices.data(), S.data(), K.data(), 
                           r.data(), q.data(), T.data(), 1000, type.data(), 
                           1e-5, 1000, stream);
     // Compute implied volatilities
     std::vector<double> impliedVols;
-    impliedVols = pricer.computeImpliedVolatilityDevice();
+    impliedVols = pricer->computeImpliedVolatilityDevice();
     // Define GreekParams
     GreekParams params;
     params.dSpot = dSpot;
@@ -122,9 +71,9 @@ std::vector<OptionData> processBatch(const std::vector<OptionData>& batch,
     params.dYield = dYield;
     params.dTime = dTime;
     params.dVol = dVol;
-    std::cout << "Implied Vols: " << impliedVols.size() << std::endl;
+    //std::cout << "Implied Vols: " << impliedVols.size() << std::endl;
     // Calculate Greeks
-    std::vector<Greeks> greeks = pricer.calculateAllGreeks(params, impliedVols);
+    std::vector<Greeks> greeks = pricer->calculateAllGreeks(params, impliedVols);
 
     // Assign results to options
     std::vector<OptionData> results;
@@ -159,6 +108,9 @@ std::vector<OptionData> processBatch(const std::vector<OptionData>& batch,
 
         results.push_back(option);
     }
+    // Clean up
+    delete pricer;
+    cudaStreamDestroy(stream);
 
     return results;
 }
@@ -229,52 +181,73 @@ int main() {
     std::string output_filename = "/home/qhawkins/Desktop/GMEStudy/implied_volatilities_mc.csv";
     std::vector<OptionData> options = read_csv(input_filename);
 
-    const int NUM_STREAMS = 32; // Adjust based on your GPU capabilities
-    std::vector<cudaStream_t> streams(NUM_STREAMS);
-    for (int i = 0; i < NUM_STREAMS; ++i) {
-        CHECK_CUDA_ERROR(cudaStreamCreateWithFlags(&streams[i], cudaStreamNonBlocking));
-    }
+    const int BATCH_SIZE = 32;
 
-    const int BATCH_SIZE = 512;
+    // Initialize ThreadPool with 16 threads
+    ThreadPool pool(16);
 
-    ThreadPool* pool = new ThreadPool(16);
+    ConcurrentQueue<BatchResult> results_queue;
 
-    std::vector<std::future<std::vector<OptionData>>> futures;
-    for (size_t i = 0; i < options.size(); i += BATCH_SIZE) {
-        size_t end = std::min(i + BATCH_SIZE, options.size());
-        //i = i >= end ? end-BATCH_SIZE : i; 
-        std::vector<OptionData> batch(options.begin() + i, options.begin() + end);
-        //std::cout << "Batch S: " << batch[0].underlying_price << " K: " << batch[0].strike_price << " r: " << batch[0].rfr << " T: " << batch[0].years_to_expiration << std::endl;
-        futures.push_back(pool->enqueue([batch, &streams, i, NUM_STREAMS]()->std::vector<OptionData> {
-            return processBatch(batch, streams[i / BATCH_SIZE % NUM_STREAMS]);
-        }));
-    }
-    std::cout << "Queue created" << std::endl;
-    // Collect results in order
-    std::vector<std::vector<OptionData>> results;
-    auto start = std::chrono::high_resolution_clock::now();
-    for (size_t i = 0; i < futures.size(); ++i) {
-        futures[i].wait();
-    }
-    for (size_t i = 0; i < futures.size(); ++i) {
-        std::cout << "Waiting for future " << i << std::endl;
-        results.push_back(futures[i].get());
-    }
+    // Initialize final_results and its mutex
     std::vector<OptionData> final_results;
-    for (const auto& result : results) {
-        for (const auto& option : result) {
-            final_results.push_back(option);
-        }
-    }
-    auto end = std::chrono::high_resolution_clock::now();
-    std::chrono::duration<double> elapsed = end - start;
+    std::mutex final_results_mutex;
 
-    // Clean up CUDA streams
-    for (int i = 0; i < NUM_STREAMS; ++i) {
-        CHECK_CUDA_ERROR(cudaStreamDestroy(streams[i]));
+    // Start consumer thread to process results as they come in
+    std::thread consumer([&results_queue, &final_results, &final_results_mutex]() {
+        while(true){
+            BatchResult batch;
+            results_queue.wait_and_pop(batch);
+            if(batch.is_sentinel){
+                std::cout << "Consumer thread received sentinel. Exiting." << std::endl;
+                break;
+            }
+            // Append to final_results
+            std::unique_lock<std::mutex> lock(final_results_mutex);
+            final_results.insert(final_results.end(), batch.data.begin(), batch.data.end());
+            std::cout << "Consumer thread processed a batch of size " << batch.data.size() << "." << std::endl;
+        }
+    });
+
+
+    // Enqueue all batches
+    int num_batches = (options.size() + BATCH_SIZE - 1) / BATCH_SIZE;
+    std::vector<std::future<void>> task_futures;
+
+    auto start_time = std::chrono::high_resolution_clock::now();
+
+    for(int i = 0; i < num_batches; ++i){
+        size_t start_idx = i * BATCH_SIZE;
+        size_t end_idx = std::min(start_idx + BATCH_SIZE, (size_t)options.size());
+        std::vector<OptionData> batch(options.begin() + start_idx, options.begin() + end_idx);
+
+        // Enqueue a task that processes the batch and pushes the result to the queue
+        task_futures.emplace_back(
+            pool.enqueue([batch, &results_queue]() -> void {
+                std::vector<OptionData> processed_batch = processBatch(batch);
+                // Push the result to the results queue
+                results_queue.push(BatchResult{ processed_batch, false });
+            })
+        );
     }
-    // Print or save results
-    for (const auto& result : final_results) {
+
+    // Wait for all tasks to finish
+    for(auto &fut : task_futures){
+        fut.wait();
+    }
+
+    // After all tasks are done, push a sentinel to stop the consumer
+    results_queue.push(BatchResult{ std::vector<OptionData>(), true });
+
+    // Wait for the consumer thread to finish
+    consumer.join();
+
+    auto end_time = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> elapsed = end_time - start_time;
+
+    // Output or save results as needed
+    // Example: Print first few results
+    for (size_t i = 0; i < std::min((size_t)5, final_results.size()); ++i) {
+        const auto& result = final_results[i];
         std::cout << "Contract ID: " << result.contract_id << std::endl;
         std::cout << "Timestamp: " << result.timestamp << std::endl;
         std::cout << "Market Price: " << result.market_price << std::endl;
@@ -293,10 +266,10 @@ int main() {
         std::cout << "Zomma: " << result.zomma << std::endl;
         std::cout << "Color: " << result.color << std::endl;
         std::cout << "Ultima: " << result.ultima << std::endl;
-        std::cout << std::endl;
+        std::cout << "----------------------------------------" << std::endl;
     }
-    std::cout << "Elapsed time: " << elapsed.count() << "s" << std::endl;
 
+    std::cout << "Elapsed time: " << elapsed.count() << " seconds." << std::endl;
 
     return 0;
 }
