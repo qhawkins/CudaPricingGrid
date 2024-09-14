@@ -1,23 +1,26 @@
-cmake_minimum_required(VERSION 3.10) # Set the minimum version of CMake required
+cmake_minimum_required(VERSION 3.18) # Set the minimum version of CMake required
 
-project(CudaPricingGrid LANGUAGES CUDA) # Name of your project
+project(CudaPricingGrid LANGUAGES CXX CUDA) # Name of your project
 set(CMAKE_CUDA_ARCHITECTURES 89)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -mavx2 -mfma")
-set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 -gencode arch=compute_89,code=sm_89")
+set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 -gencode arch=compute_89,code=sm_89 -rdc=true")
 # Set the C++ standard you wish to use (you could use C++11, C++14, C++17, etc.)
 #set(CMAKE_CXX_STANDARD 17)
 #set(CMAKE_CXX_STANDARD_REQUIRED True)
 #set(CMAKE CUDA_STANDARD 12.2)
 
+set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
+
+
 #find_package(Boost 1.84.0 REQUIRED COMPONENTS json)
 #find_package(Boost COMPONENTS system REQUIRED) # Find Boost system library
 
-#find_package(OpenSSL REQUIRED)
+find_package(CUDAToolkit REQUIRED)
 # Add executable target with source files
-link_libraries(-lcublas -lcusolver)
+link_libraries(-lcublas -lcusolver -lcudadevrt)
 add_executable(CudaPricingGrid 
                main.cu
-               kernels.cu
+               kernels.cu  
                )
 set_source_files_properties(main.cu kernels.cu PROPERTIES FORCE_LANGUAGE CUDA LINKER_LANGUAGE CUDA)
 

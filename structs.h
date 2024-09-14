@@ -45,4 +45,58 @@ struct OptionData {
     float modelPrice;
 };
 
+struct GreekParams {
+    std::vector<double> dSpot;       // Step size for spot price
+    std::vector<double> dStrike;     // Step size for strike price
+    std::vector<double> dRate;       // Step size for interest rate
+    std::vector<double> dYield;      // Step size for dividend yield
+    std::vector<double> dTime;       // Step size for time to maturity
+    std::vector<double> dVol;        // Step size for volatility
+};
+
+struct OptionGreeks {
+    double delta;
+    double theta;
+    double vega;
+    double rho;
+
+    double gamma;
+    double vanna;
+    double charm;
+    double vomma;
+    double veta;
+    double vera;
+
+    double speed;
+    double zomma;
+    double color;
+    double ultima;
+
+};
+
+struct Greeks {
+    // First-order Greeks
+    double delta;
+    double vega;
+    double theta;
+    double rho;
+
+    // Second-order Greeks
+    double gamma;
+    double vanna;
+    double charm;
+    double vomma;
+    double veta;
+    double vera;
+
+    // Third-order Greeks
+    double speed;
+    double zomma;
+    double color;
+    double ultima;
+
+    // Additional values
+    double impliedVolatility;
+};
+
 #endif // STRUCTS_H
