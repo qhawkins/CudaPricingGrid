@@ -113,8 +113,7 @@ std::vector<OptionData> processBatch(const std::vector<OptionData>& batch,
                           1e-5, 1000, stream);
     // Compute implied volatilities
     std::vector<double> impliedVols;
-    pricer.computeImpliedVolatility(impliedVols);
-
+    impliedVols = pricer.computeImpliedVolatilityDevice();
     // Define GreekParams
     GreekParams params;
     params.dSpot = dSpot;
@@ -123,9 +122,9 @@ std::vector<OptionData> processBatch(const std::vector<OptionData>& batch,
     params.dYield = dYield;
     params.dTime = dTime;
     params.dVol = dVol;
-
+    std::cout << "Implied Vols: " << impliedVols.size() << std::endl;
     // Calculate Greeks
-    std::vector<Greeks> greeks = pricer.calculateAllGreeks(params);
+    std::vector<Greeks> greeks = pricer.calculateAllGreeks(params, impliedVols);
 
     // Assign results to options
     std::vector<OptionData> results;

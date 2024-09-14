@@ -1,84 +1,92 @@
 #include "kernels.cuh"
 
-// Initialize asset prices and option values
-__global__ void initializeAssetPrices(double* prices, double* values, 
-                                      double S, double K, double u, double d, 
-                                      int steps, int optionType, int batchIndex, 
-                                      int steps_plus_one) {
-    int idx = threadIdx.x + blockIdx.x * blockDim.x;
-    if (idx < steps_plus_one) {
-        prices[batchIndex * steps_plus_one + idx] = S * pow(u, steps - idx) * pow(d, idx);
+// Device function to compute option price using a binomial tree
+__device__ double deviceOptionPrice(int steps, double S, double K, double r, double q, double T, double sigma, int optionType) {
+    double dt = T / steps;
+    double u = exp(sigma * sqrt(dt));
+    double d = 1.0 / u;
+    double p = (exp((r - q) * dt) - d) / (u - d);
+
+    // Validate p
+    if (p < 0.0 || p > 1.0) {
+        return NAN;
+    }
+
+    // Initialize option values at maturity
+    double option_values[1024]; // Assuming steps <= 1023
+    if (steps >= 1024) {
+        // Exceeded maximum steps
+        return NAN;
+    }
+
+    for (int i = 0; i <= steps; i++) {
+        double price = S * pow(u, steps - i) * pow(d, i);
         if (optionType == 0) { // Call
-            values[batchIndex * steps_plus_one + idx] = fmax(0.0, 
-                prices[batchIndex * steps_plus_one + idx] - K);
+            option_values[i] = fmax(0.0, price - K);
         } else { // Put
-            values[batchIndex * steps_plus_one + idx] = fmax(0.0, 
-                K - prices[batchIndex * steps_plus_one + idx]);
+            option_values[i] = fmax(0.0, K - price);
         }
     }
-}
 
-// Backward induction to compute option values
-__global__ void backwardInduction(double* values, double* prices, 
-                                  int step, double p, double r, double dt, 
-                                  int steps_plus_one, int batchIndex) {
-    int idx = threadIdx.x + blockIdx.x * blockDim.x;
-    if (idx < step + 1) {
-        double expectedValue = p * values[batchIndex * steps_plus_one + idx] + 
-                               (1.0 - p) * values[batchIndex * steps_plus_one + idx + 1];
-        expectedValue *= exp(-r * dt);
-        // Update the option value at this node
-        values[batchIndex * steps_plus_one + idx] = expectedValue;
+    // Perform backward induction
+    for (int step = steps - 1; step >= 0; step--) {
+        for (int i = 0; i <= step; i++) {
+            option_values[i] = (p * option_values[i] + (1.0 - p) * option_values[i + 1]) * exp(-r * dt);
+        }
     }
+
+    return option_values[0];
 }
 
-// Kernel to calculate option prices for a batch
-__global__ void calculatePrice(int steps, int batchSize, double* price, 
-                               double* batchedS, double* batchedK, double* batchedR, 
-                               double* batchedQ, double* batchedT, int* batchedType, 
-                               double* batchedSigma, double* prices, double* values) {
+// Kernel to compute implied volatility using bisection
+__global__ void computeImpliedVolatilityKernel(int steps, int batchSize, double* marketPrices, 
+                                              double* S, double* K, double* r, double* q, 
+                                              double* T, int* optionType, double* ivResults, 
+                                              double tol, int max_iter) {
     int idx = threadIdx.x + blockIdx.x * blockDim.x;
-    int steps_plus_one = steps + 1;
-    if (idx < batchSize) {
-        double S = batchedS[idx];
-        double K = batchedK[idx];
-        double r = batchedR[idx];
-        double q = batchedQ[idx];
-        double T = batchedT[idx];
-        double sigma = batchedSigma[idx];
-        //printf("S: %f, K: %f, r: %f, q: %f, T: %f, sigma: %f\n", S, K, r, q, T, sigma); // Debugging output
-        int optionType = batchedType[idx];
-        double dt = T / steps;
-        double u = exp(sigma * sqrt(dt));
-        double d = 1.0 / u;
-        double p = (exp((r - q) * dt) - d) / (u - d);
+    if (idx >= batchSize) return;
 
-        //printf("U: %f, D: %f, P: %f\n", u, d, p); // Debugging output
-        
-        // Initialize asset prices and option values
-        int threadsPerBlock = 256;
-        int blocksPerGrid = (steps_plus_one + threadsPerBlock - 1) / threadsPerBlock;
-        initializeAssetPrices<<<blocksPerGrid, threadsPerBlock>>>(
-            prices, values, S, K, u, d, steps, optionType, idx, steps_plus_one
-        );
-        __syncthreads();
-        //cudaDeviceSynchronize(); // Ensure initialization is complete
+    double target = marketPrices[idx];
+    double a = 0.01;
+    double b = 3.0;
+    double fa = deviceOptionPrice(steps, S[idx], K[idx], r[idx], q[idx], T[idx], a, optionType[idx]) - target;
+    double fb = deviceOptionPrice(steps, S[idx], K[idx], r[idx], q[idx], T[idx], b, optionType[idx]) - target;
 
-        // Perform backward induction
-        for (int step = steps - 1; step >= 0; step--) {
-            int current_step_plus_one = step + 1;
-            blocksPerGrid = (current_step_plus_one + threadsPerBlock - 1) / threadsPerBlock;
-            backwardInduction<<<blocksPerGrid, threadsPerBlock>>>(
-                values, prices, step, p, r, dt, steps_plus_one, idx
-            );
-            __syncthreads();
+    if (isnan(fa) || isnan(fb)) {
+        // Root not bracketed or invalid price
+        ivResults[idx] = -1.0;
+        return;
+    }
+
+    double c, fc;
+    for (int iter = 0; iter < max_iter; iter++) {
+        c = 0.5 * (a + b);
+        fc = deviceOptionPrice(steps, S[idx], K[idx], r[idx], q[idx], T[idx], c, optionType[idx]) - target;
+
+        if (fabs(fc) < tol) {
+            ivResults[idx] = c;
+            return;
         }
 
-        printf("Sigma: %f, U: %f, D: %f, P: %f, Price: %f\n", sigma, u, d, p, values[idx * steps_plus_one]); // Debugging output
-
-
-        // Assign the computed option price
-        //printf("Price: %f\n", values[idx * steps_plus_one]); // Debugging output
-        price[idx] = values[idx * steps_plus_one];
+        if (fa * fc < 0.0) {
+            b = c;
+            fb = fc;
+        } else {
+            a = c;
+            fa = fc;
+        }
     }
+
+    ivResults[idx] = c; // Best estimate after max iterations
 }
+
+__global__ void priceOptionsKernel(int steps, int batchSize, 
+                                   double* S, double* K, double* r, 
+                                   double* q, double* T, double* sigma, 
+                                   int* optionType, double* prices) {
+    int idx = threadIdx.x + blockIdx.x * blockDim.x;
+    if (idx >= batchSize) return;
+
+    prices[idx] = deviceOptionPrice(steps, S[idx], K[idx], r[idx], q[idx], T[idx], sigma[idx], optionType[idx]);
+}
+

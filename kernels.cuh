@@ -6,20 +6,15 @@
 #include <iostream>
 
 // Initialize asset prices and option values
-__global__ void initializeAssetPrices(double* prices, double* values, 
-                                      double S, double K, double u, double d, 
-                                      int steps, int optionType, int batchIndex, 
-                                      int steps_plus_one);
 
-// Backward induction to compute option values
-__global__ void backwardInduction(double* values, double* prices, 
-                                  int step, double p, double r, double dt, 
-                                  int steps_plus_one, int batchIndex);
+__global__ void computeImpliedVolatilityKernel(int steps, int batchSize, double* marketPrices, 
+                                              double* S, double* K, double* r, double* q, 
+                                              double* T, int* optionType, double* ivResults, 
+                                              double tol, int max_iter);
 
-// Kernel to calculate option prices for a batch
-__global__ void calculatePrice(int steps, int batchSize, double* price, 
-                               double* batchedS, double* batchedK, double* batchedR, 
-                               double* batchedQ, double* batchedT, int* batchedType, 
-                               double* batchedSigma, double* prices, double* values);
-
+__global__ void priceOptionsKernel(int steps, int batchSize, 
+                                   double* S, double* K, double* r, 
+                                   double* q, double* T, double* sigma, 
+                                   int* optionType, double* prices);                                     
 #endif // KERNELS_CUH
+
