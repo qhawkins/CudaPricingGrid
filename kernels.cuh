@@ -3,6 +3,7 @@
 
 #include <cuda_runtime.h>
 #include <cmath>
+#include <iostream>
 
 // Initialize asset prices and option values
 __global__ void initializeAssetPrices(double* prices, double* values, 

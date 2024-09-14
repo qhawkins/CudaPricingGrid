@@ -46,11 +46,14 @@ __global__ void calculatePrice(int steps, int batchSize, double* price,
         double q = batchedQ[idx];
         double T = batchedT[idx];
         double sigma = batchedSigma[idx];
+        //printf("S: %f, K: %f, r: %f, q: %f, T: %f, sigma: %f\n", S, K, r, q, T, sigma); // Debugging output
         int optionType = batchedType[idx];
         double dt = T / steps;
         double u = exp(sigma * sqrt(dt));
         double d = 1.0 / u;
         double p = (exp((r - q) * dt) - d) / (u - d);
+
+        //printf("U: %f, D: %f, P: %f\n", u, d, p); // Debugging output
         
         // Initialize asset prices and option values
         int threadsPerBlock = 256;
@@ -71,7 +74,11 @@ __global__ void calculatePrice(int steps, int batchSize, double* price,
             __syncthreads();
         }
 
+        printf("Sigma: %f, U: %f, D: %f, P: %f, Price: %f\n", sigma, u, d, p, values[idx * steps_plus_one]); // Debugging output
+
+
         // Assign the computed option price
+        //printf("Price: %f\n", values[idx * steps_plus_one]); // Debugging output
         price[idx] = values[idx * steps_plus_one];
     }
 }

@@ -111,14 +111,6 @@ std::vector<OptionData> processBatch(const std::vector<OptionData>& batch,
     CRROptionPricer pricer(batch_size, marketPrices.data(), S.data(), K.data(), 
                           r.data(), q.data(), T.data(), 1000, type.data(), 
                           1e-5, 1000, stream);
-
-    // Compute option prices
-    pricer.computeOptionPrices();
-
-    // Retrieve option prices
-    std::vector<double> host_price;
-    pricer.retrieveOptionPrices(host_price);
-
     // Compute implied volatilities
     std::vector<double> impliedVols;
     pricer.computeImpliedVolatility(impliedVols);
@@ -140,7 +132,7 @@ std::vector<OptionData> processBatch(const std::vector<OptionData>& batch,
     results.reserve(batch_size);
     for (int i = 0; i < batch_size; i++) {
         OptionData option = batch[i];
-        option.modelPrice = host_price[i];
+        //option.modelPrice = host_price[i];
         option.impliedVolatility = impliedVols[i];
         if (option.impliedVolatility < 0) {
             // Handle failure to compute IV
@@ -216,7 +208,7 @@ std::vector<OptionData> read_csv(const std::string& filename) {
                 //    continue;
                // }
                 options.push_back(option);
-                if (options.size() == 1024) {
+                if (options.size() == 16384) {
                     break;
                 }
             } catch (const std::exception& e) {
@@ -238,13 +230,13 @@ int main() {
     std::string output_filename = "/home/qhawkins/Desktop/GMEStudy/implied_volatilities_mc.csv";
     std::vector<OptionData> options = read_csv(input_filename);
 
-    const int NUM_STREAMS = 16; // Adjust based on your GPU capabilities
+    const int NUM_STREAMS = 32; // Adjust based on your GPU capabilities
     std::vector<cudaStream_t> streams(NUM_STREAMS);
     for (int i = 0; i < NUM_STREAMS; ++i) {
         CHECK_CUDA_ERROR(cudaStreamCreateWithFlags(&streams[i], cudaStreamNonBlocking));
     }
 
-    const int BATCH_SIZE = NUM_STREAMS;
+    const int BATCH_SIZE = 512;
 
     ThreadPool* pool = new ThreadPool(16);
 
@@ -266,6 +258,7 @@ int main() {
         futures[i].wait();
     }
     for (size_t i = 0; i < futures.size(); ++i) {
+        std::cout << "Waiting for future " << i << std::endl;
         results.push_back(futures[i].get());
     }
     std::vector<OptionData> final_results;

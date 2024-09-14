@@ -38,6 +38,7 @@ private:
     double *d_S, *d_K, *d_r, *d_q, *d_T;
     int *d_optionType;
     double *d_price, *d_prices, *d_values;
+    double *d_price_low, *d_price_high, *d_price_mid;
     double *d_sigma;
 
     // Stream
@@ -66,7 +67,9 @@ public:
         CHECK_CUDA_ERROR(cudaMallocAsync(&d_prices, prices_size, stream));
         CHECK_CUDA_ERROR(cudaMallocAsync(&d_values, prices_size, stream));
         CHECK_CUDA_ERROR(cudaMallocAsync(&d_sigma, size, stream));
-
+        CHECK_CUDA_ERROR(cudaMallocAsync(&d_price_low, size, stream));
+        CHECK_CUDA_ERROR(cudaMallocAsync(&d_price_high, size, stream));
+        CHECK_CUDA_ERROR(cudaMallocAsync(&d_price_mid, size, stream));
         // Copy data to device asynchronously
         CHECK_CUDA_ERROR(cudaMemcpyAsync(d_S, S, size, cudaMemcpyHostToDevice, stream));
         CHECK_CUDA_ERROR(cudaMemcpyAsync(d_K, K, size, cudaMemcpyHostToDevice, stream));
@@ -89,15 +92,18 @@ public:
         cudaFreeAsync(d_prices, stream);
         cudaFreeAsync(d_values, stream);
         cudaFreeAsync(d_sigma, stream);
+        cudaFreeAsync(d_price_low, stream);
+        cudaFreeAsync(d_price_high, stream);
+        cudaFreeAsync(d_price_mid, stream);
     }
 
-    // Function to compute option prices asynchronously
-    void computeOptionPrices() {
-        int threadsPerBlock = 256;
+    // Add an output buffer parameter
+    void computeOptionPrices(double* d_output_price) {
+        int threadsPerBlock = 1024; // Max threads per block for many GPUs
         int blocksPerGrid = (batch_size + threadsPerBlock - 1) / threadsPerBlock;
 
         calculatePrice<<<blocksPerGrid, threadsPerBlock, 0, stream>>>(
-            steps, batch_size, d_price, d_S, d_K, d_r, d_q, d_T, 
+            steps, batch_size, d_output_price, d_S, d_K, d_r, d_q, d_T, 
             d_optionType, d_sigma, d_prices, d_values
         );
         CHECK_CUDA_ERROR(cudaGetLastError());
@@ -109,142 +115,6 @@ public:
         CHECK_CUDA_ERROR(cudaMemcpyAsync(host_price.data(), d_price, 
                                         batch_size * sizeof(double), 
                                         cudaMemcpyDeviceToHost, stream));
-    }
-
-    // Function to compute implied volatility using the bisection method asynchronously
-    void computeIV(std::vector<double>& impliedVols) {
-        impliedVols.resize(batch_size, -1.0); // Initialize with -1 indicating failure
-
-        // Allocate device memory for computed prices at different sigmas
-        double *d_price_low, *d_price_high, *d_price_mid;
-        CHECK_CUDA_ERROR(cudaMallocAsync(&d_price_low, batch_size * sizeof(double), stream));
-        CHECK_CUDA_ERROR(cudaMallocAsync(&d_price_high, batch_size * sizeof(double), stream));
-        CHECK_CUDA_ERROR(cudaMallocAsync(&d_price_mid, batch_size * sizeof(double), stream));
-
-        // Initial guess bounds
-        double sigma_low = 0.01;
-        double sigma_high = 3.0;
-
-        // Compute prices at sigma_low
-        double *d_sigma_low = nullptr;
-        CHECK_CUDA_ERROR(cudaMallocAsync(&d_sigma_low, batch_size * sizeof(double), stream));
-        std::vector<double> sigma_low_vec(batch_size, sigma_low);
-        CHECK_CUDA_ERROR(cudaMemcpyAsync(d_sigma_low, sigma_low_vec.data(), 
-                                        batch_size * sizeof(double), 
-                                        cudaMemcpyHostToDevice, stream));
-
-        // Launch kernel to compute prices at sigma_low
-        calculatePrice<<<(batch_size + 255) / 256, 256, 0, stream>>>(
-            steps, batch_size, d_price_low, d_S, d_K, d_r, d_q, d_T, 
-            d_optionType, d_sigma_low, d_prices, d_values
-        );
-        CHECK_CUDA_ERROR(cudaGetLastError());
-
-        // Compute prices at sigma_high
-        double *d_sigma_high = nullptr;
-        CHECK_CUDA_ERROR(cudaMallocAsync(&d_sigma_high, batch_size * sizeof(double), stream));
-        std::vector<double> sigma_high_vec(batch_size, sigma_high);
-        CHECK_CUDA_ERROR(cudaMemcpyAsync(d_sigma_high, sigma_high_vec.data(), 
-                                        batch_size * sizeof(double), 
-                                        cudaMemcpyHostToDevice, stream));
-
-        // Launch kernel to compute prices at sigma_high
-        calculatePrice<<<(batch_size + 255) / 256, 256, 0, stream>>>(
-            steps, batch_size, d_price_high, d_S, d_K, d_r, d_q, d_T, 
-            d_optionType, d_sigma_high, d_prices, d_values
-        );
-        CHECK_CUDA_ERROR(cudaGetLastError());
-
-        // Synchronize to ensure initial price computations are complete
-        CHECK_CUDA_ERROR(cudaStreamSynchronize(stream));
-
-        // Copy prices back to host
-        std::vector<double> price_low(batch_size);
-        std::vector<double> price_high(batch_size);
-        CHECK_CUDA_ERROR(cudaMemcpyAsync(price_low.data(), d_price_low, 
-                                        batch_size * sizeof(double), 
-                                        cudaMemcpyDeviceToHost, stream));
-        CHECK_CUDA_ERROR(cudaMemcpyAsync(price_high.data(), d_price_high, 
-                                        batch_size * sizeof(double), 
-                                        cudaMemcpyDeviceToHost, stream));
-
-        // Synchronize to ensure data is copied
-        CHECK_CUDA_ERROR(cudaStreamSynchronize(stream));
-
-        // Perform bisection on host
-        for (int i = 0; i < batch_size; ++i) {
-            double price_target = marketPrices[i];
-            double f_low = price_low[i] - price_target;
-            double f_high = price_high[i] - price_target;
-
-            if (f_low * f_high > 0) {
-                // Root not bracketed
-                impliedVols[i] = -1.0;
-                continue;
-            }
-
-            double a = sigma_low;
-            double b = sigma_high;
-            double fa_val = f_low;
-            double fb_val = f_high;
-            double c, fc_val;
-
-            for (int iter = 0; iter < max_iter; ++iter) {
-                c = 0.5 * (a + b);
-                // Compute price at c
-                // Launch kernel to compute price_mid
-                double *d_sigma_mid = nullptr;
-                CHECK_CUDA_ERROR(cudaMallocAsync(&d_sigma_mid, batch_size * sizeof(double), stream));
-                std::vector<double> sigma_mid_vec(batch_size, c);
-                CHECK_CUDA_ERROR(cudaMemcpyAsync(d_sigma_mid, sigma_mid_vec.data(), 
-                                                batch_size * sizeof(double), 
-                                                cudaMemcpyHostToDevice, stream));
-
-                calculatePrice<<<(batch_size + 255) / 256, 256, 0, stream>>>(
-                    steps, batch_size, d_price_mid, d_S, d_K, d_r, d_q, d_T, 
-                    d_optionType, d_sigma_mid, d_prices, d_values
-                );
-                CHECK_CUDA_ERROR(cudaGetLastError());
-
-                // Copy price_mid back to host
-                std::vector<double> price_mid(batch_size);
-                CHECK_CUDA_ERROR(cudaMemcpyAsync(price_mid.data(), d_price_mid, 
-                                                batch_size * sizeof(double), 
-                                                cudaMemcpyDeviceToHost, stream));
-                CHECK_CUDA_ERROR(cudaStreamSynchronize(stream));
-
-                // Calculate f(c)
-                fc_val = 0.0;
-                double f_mid;
-                // Assuming batch-wise operation
-                // Here, you should ideally have f_mid as an array
-                // For simplicity, compute one by one
-                // You can optimize this further
-                // Here, since it's batch-wise, we need to loop
-                // But it's not feasible to assign to impliedVols[i] in parallel
-                // Therefore, a better approach would be to implement root-finding on the GPU
-                // However, for simplicity, we'll perform it on the host
-
-                // Assign impliedVols[i] based on f(c)
-                // Implemented outside of this loop
-                // Therefore, we need to collect all price_mid first
-
-                // This requires a more complex setup; for simplicity, implement on host
-                // Therefore, perform per-option bisection on the host
-
-                // Hence, it's better to implement computeIV per-option
-                // Here, we assign -1.0 and leave computeIV to be called per-option
-                impliedVols[i] = -1.0; // Placeholder
-                CHECK_CUDA_ERROR(cudaFreeAsync(d_sigma_mid, stream));
-            }
-        }
-
-        // Free temporary device memory
-        cudaFreeAsync(d_sigma_low, stream);
-        cudaFreeAsync(d_sigma_high, stream);
-        cudaFreeAsync(d_price_low, stream);
-        cudaFreeAsync(d_price_high, stream);
-        cudaFreeAsync(d_price_mid, stream);
     }
 
     // Function to calculate all Greeks
@@ -511,51 +381,43 @@ public:
         double sigma_low = 0.01;
         double sigma_high = 3.0;
 
-        // Allocate device memory for low and high sigma
-        double *d_sigma_low, *d_sigma_high;
-        CHECK_CUDA_ERROR(cudaMallocAsync(&d_sigma_low, batch_size * sizeof(double), stream));
-        CHECK_CUDA_ERROR(cudaMallocAsync(&d_sigma_high, batch_size * sizeof(double), stream));
-
-        // Initialize low and high sigma on host
+        // Initialize sigma_low and sigma_high on host
         std::vector<double> sigma_low_vec(batch_size, sigma_low);
         std::vector<double> sigma_high_vec(batch_size, sigma_high);
-
+    
         // Copy sigma_low and sigma_high to device
-        CHECK_CUDA_ERROR(cudaMemcpyAsync(d_sigma_low, sigma_low_vec.data(), 
+        CHECK_CUDA_ERROR(cudaMemcpyAsync(d_sigma, sigma_low_vec.data(), 
                                         batch_size * sizeof(double), 
                                         cudaMemcpyHostToDevice, stream));
-        CHECK_CUDA_ERROR(cudaMemcpyAsync(d_sigma_high, sigma_high_vec.data(), 
+        // Launch kernel to compute price_low
+        computeOptionPrices(d_price_low); 
+
+        // Wait for price_low to be computed
+        CHECK_CUDA_ERROR(cudaStreamSynchronize(stream));
+
+        // Copy sigma_high to device
+        CHECK_CUDA_ERROR(cudaMemcpyAsync(d_sigma, sigma_high_vec.data(), 
                                         batch_size * sizeof(double), 
                                         cudaMemcpyHostToDevice, stream));
+        // Launch kernel to compute price_high
+        computeOptionPrices(d_price_high); // This should write to d_price_high
 
-        // Compute prices at sigma_low
-        calculatePrice<<<(batch_size + 255) / 256, 256, 0, stream>>>(
-            steps, batch_size, d_price, d_S, d_K, d_r, d_q, d_T, 
-            d_optionType, d_sigma_low, d_prices, d_values
-        );
-        CHECK_CUDA_ERROR(cudaGetLastError());
-
-        // Compute prices at sigma_high
-        calculatePrice<<<(batch_size + 255) / 256, 256, 0, stream>>>(
-            steps, batch_size, d_price, d_S, d_K, d_r, d_q, d_T, 
-            d_optionType, d_sigma_high, d_prices, d_values
-        );
-        CHECK_CUDA_ERROR(cudaGetLastError());
-
-        // Synchronize to ensure computations are complete
+        // Wait for price_high to be computed
         CHECK_CUDA_ERROR(cudaStreamSynchronize(stream));
 
         // Retrieve prices from device
         std::vector<double> price_low(batch_size);
         std::vector<double> price_high(batch_size);
-        CHECK_CUDA_ERROR(cudaMemcpyAsync(price_low.data(), d_price, 
+        CHECK_CUDA_ERROR(cudaMemcpyAsync(price_low.data(), d_price_low, 
                                         batch_size * sizeof(double), 
                                         cudaMemcpyDeviceToHost, stream));
-        CHECK_CUDA_ERROR(cudaMemcpyAsync(price_high.data(), d_price, 
+        CHECK_CUDA_ERROR(cudaMemcpyAsync(price_high.data(), d_price_high, 
                                         batch_size * sizeof(double), 
                                         cudaMemcpyDeviceToHost, stream));
-        CHECK_CUDA_ERROR(cudaStreamSynchronize(stream));
 
+        // Synchronize to ensure data is copied
+        CHECK_CUDA_ERROR(cudaStreamSynchronize(stream));
+        std::cout << "Price Low: " << price_low[0] << ", Price High: " << price_high[0] << std::endl;
         // Perform bisection on host
         for (int i = 0; i < batch_size; ++i) {
             double target = marketPrices[i];
@@ -576,31 +438,32 @@ public:
 
             for (int iter = 0; iter < max_iter; ++iter) {
                 c = 0.5 * (a + b);
-                double fc;
-
-                // Compute price at c
                 double sigma_mid = c;
+
                 // Allocate device memory for sigma_mid
                 double *d_sigma_mid;
                 CHECK_CUDA_ERROR(cudaMallocAsync(&d_sigma_mid, batch_size * sizeof(double), stream));
+
+                // Initialize sigma_mid on host
                 std::vector<double> sigma_mid_vec(batch_size, sigma_mid);
                 CHECK_CUDA_ERROR(cudaMemcpyAsync(d_sigma_mid, sigma_mid_vec.data(), 
                                                 batch_size * sizeof(double), 
                                                 cudaMemcpyHostToDevice, stream));
 
-                // Compute price_mid
-                calculatePrice<<<(batch_size + 255) / 256, 256, 0, stream>>>(
-                    steps, batch_size, d_price, d_S, d_K, d_r, d_q, d_T, 
-                    d_optionType, d_sigma_mid, d_prices, d_values
-                );
-                CHECK_CUDA_ERROR(cudaGetLastError());
+                // Copy sigma_mid to d_sigma
+                CHECK_CUDA_ERROR(cudaMemcpyAsync(d_sigma, d_sigma_mid, 
+                                                batch_size * sizeof(double), 
+                                                cudaMemcpyDeviceToDevice, stream));
 
-                // Synchronize to ensure price_mid is computed
+                // Launch kernel to compute price_mid
+                computeOptionPrices(d_price_mid); // This should write to d_price_mid
+
+                // Wait for price_mid to be computed
                 CHECK_CUDA_ERROR(cudaStreamSynchronize(stream));
 
                 // Retrieve price_mid from device
                 std::vector<double> price_mid(batch_size);
-                CHECK_CUDA_ERROR(cudaMemcpyAsync(price_mid.data(), d_price, 
+                CHECK_CUDA_ERROR(cudaMemcpyAsync(price_mid.data(), d_price_mid, 
                                                 batch_size * sizeof(double), 
                                                 cudaMemcpyDeviceToHost, stream));
                 CHECK_CUDA_ERROR(cudaStreamSynchronize(stream));
@@ -626,9 +489,8 @@ public:
         }
 
         // Free temporary device memory
-        cudaFreeAsync(d_sigma_low, stream);
-        cudaFreeAsync(d_sigma_high, stream);
     }
+
 };
 
 #endif // CRROPTIONPRICER_H
