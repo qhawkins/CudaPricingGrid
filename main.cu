@@ -25,7 +25,7 @@ struct BatchResult {
 };
 
 // Function to process a single batch
-std::vector<OptionData> processBatch(const std::vector<OptionData>& batch) 
+void processBatch(std::vector<OptionData> batch) 
 {
     cudaStream_t stream;
     CHECK_CUDA_ERROR(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking));
@@ -75,11 +75,8 @@ std::vector<OptionData> processBatch(const std::vector<OptionData>& batch)
     // Calculate Greeks
     std::vector<Greeks> greeks = pricer->calculateAllGreeks(params, impliedVols);
 
-    // Assign results to options
-    std::vector<OptionData> results;
-    results.reserve(batch_size);
     for (int i = 0; i < batch_size; i++) {
-        OptionData option = batch[i];
+        OptionData &option = batch[i];
         //option.modelPrice = host_price[i];
         option.impliedVolatility = impliedVols[i];
         if (option.impliedVolatility < 0) {
@@ -106,13 +103,11 @@ std::vector<OptionData> processBatch(const std::vector<OptionData>& batch)
         option.color = greeks[i].color;
         option.ultima = greeks[i].ultima;
 
-        results.push_back(option);
     }
     // Clean up
     delete pricer;
     cudaStreamDestroy(stream);
 
-    return results;
 }
 
 std::vector<OptionData> read_csv(const std::string& filename) {
@@ -179,74 +174,67 @@ std::vector<OptionData> read_csv(const std::string& filename) {
 int main() {
     std::string input_filename = "/home/qhawkins/Desktop/GMEStudy/timed_opra_clean_mc.csv";
     std::string output_filename = "/home/qhawkins/Desktop/GMEStudy/implied_volatilities_mc.csv";
+
+    // Step 1: Read options from CSV
     std::vector<OptionData> options = read_csv(input_filename);
+    if (options.empty()) {
+        std::cerr << "No options data found. Exiting." << std::endl;
+        return 1;
+    }
 
-    const int BATCH_SIZE = 32;
-
-    // Initialize ThreadPool with 16 threads
-    ThreadPool pool(16);
-
-    ConcurrentQueue<BatchResult> results_queue;
-
-    // Initialize final_results and its mutex
-    std::vector<OptionData> final_results;
-    std::mutex final_results_mutex;
-
-    // Start consumer thread to process results as they come in
-    std::thread consumer([&results_queue, &final_results, &final_results_mutex]() {
-        while(true){
-            BatchResult batch;
-            results_queue.wait_and_pop(batch);
-            if(batch.is_sentinel){
-                std::cout << "Consumer thread received sentinel. Exiting." << std::endl;
-                break;
-            }
-            // Append to final_results
-            std::unique_lock<std::mutex> lock(final_results_mutex);
-            final_results.insert(final_results.end(), batch.data.begin(), batch.data.end());
-            std::cout << "Consumer thread processed a batch of size " << batch.data.size() << "." << std::endl;
-        }
-    });
-
-
-    // Enqueue all batches
+    // Step 2: Define batch size and calculate number of batches
+    const int BATCH_SIZE = 128;
     int num_batches = (options.size() + BATCH_SIZE - 1) / BATCH_SIZE;
-    std::vector<std::future<void>> task_futures;
+
+    // Step 3: Prepare futures for asynchronous tasks
+    std::vector<std::future<std::vector<OptionData>>> futures;
+    futures.reserve(num_batches); // Reserve space to avoid reallocations
 
     auto start_time = std::chrono::high_resolution_clock::now();
 
+    // Step 4: Launch asynchronous tasks for each batch
     for(int i = 0; i < num_batches; ++i){
         size_t start_idx = i * BATCH_SIZE;
         size_t end_idx = std::min(start_idx + BATCH_SIZE, (size_t)options.size());
         std::vector<OptionData> batch(options.begin() + start_idx, options.begin() + end_idx);
 
-        // Enqueue a task that processes the batch and pushes the result to the queue
-        task_futures.emplace_back(
-            pool.enqueue([batch, &results_queue]() -> void {
-                std::vector<OptionData> processed_batch = processBatch(batch);
-                // Push the result to the results queue
-                results_queue.push(BatchResult{ processed_batch, false });
-            })
+        // Launch async task with launch::async to ensure it runs asynchronously
+        futures.emplace_back(
+            std::async(std::launch::async, processBatch, batch)
         );
     }
 
-    // Wait for all tasks to finish
-    for(auto &fut : task_futures){
-        fut.wait();
+    // Step 5: Collect results from all futures
+    std::vector<OptionData> final_results;
+    final_results.reserve(options.size()); // Reserve space for efficiency
+    std::mutex results_mutex; // Mutex to protect final_results in case of concurrent access
+
+    for(auto &fut : futures){
+        try {
+            // Retrieve the processed batch
+            std::vector<OptionData> processed_batch = fut.get();
+
+            // Append the processed batch to final_results
+            // Using a mutex in case multiple threads try to append simultaneously
+            // However, since this loop runs in a single thread, mutex might not be necessary
+            // It's included here for demonstration and future-proofing
+            std::lock_guard<std::mutex> lock(results_mutex);
+            final_results.insert(final_results.end(),
+                                 std::make_move_iterator(processed_batch.begin()),
+                                 std::make_move_iterator(processed_batch.end()));
+        } catch(const std::exception& e) {
+            std::cerr << "Error processing batch: " << e.what() << std::endl;
+            // Handle exceptions as needed (e.g., skip this batch, retry, etc.)
+        }
     }
-
-    // After all tasks are done, push a sentinel to stop the consumer
-    results_queue.push(BatchResult{ std::vector<OptionData>(), true });
-
-    // Wait for the consumer thread to finish
-    consumer.join();
 
     auto end_time = std::chrono::high_resolution_clock::now();
     std::chrono::duration<double> elapsed = end_time - start_time;
 
-    // Output or save results as needed
-    // Example: Print first few results
-    for (size_t i = 0; i < std::min((size_t)5, final_results.size()); ++i) {
+    // Step 6: Output or save results as needed
+    // Example: Print the first few results
+    size_t print_limit = std::min<size_t>(5, final_results.size());
+    for (size_t i = 0; i < print_limit; ++i) {
         const auto& result = final_results[i];
         std::cout << "Contract ID: " << result.contract_id << std::endl;
         std::cout << "Timestamp: " << result.timestamp << std::endl;

@@ -21,9 +21,6 @@ do { \
     } \
 } while(0)
 
-// Helper function for option pricing (forward declaration)
-double optionPriceFunction(int steps, double S, double K, double r, double q, double T, double sigma, int optionType, cudaStream_t stream);
-
 // CRROptionPricer class definition
 class CRROptionPricer {
 private:

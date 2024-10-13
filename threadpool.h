@@ -13,6 +13,7 @@
 
 class ThreadPool {
 public:
+    std::queue<std::function<void()>> tasks;
     // Constructor: Initializes the pool with the given number of threads
     ThreadPool(size_t threads) : stop(false) {
         for(size_t i = 0; i < threads; ++i)
@@ -64,7 +65,7 @@ public:
         condition.notify_one(); // Notify one worker thread
         return res;
     }
-
+ 
     // Destructor: Joins all threads and cleans up
     ~ThreadPool() {
         {
@@ -81,7 +82,6 @@ private:
     std::vector<std::thread> workers;
 
     // Task queue
-    std::queue<std::function<void()>> tasks;
     
     // Synchronization
     std::mutex queue_mutex;
