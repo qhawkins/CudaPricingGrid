@@ -1,41 +1,22 @@
-cmake_minimum_required(VERSION 3.18) # Set the minimum version of CMake required
+cmake_minimum_required(VERSION 3.18)
 
 project(CudaPricingGrid LANGUAGES CXX CUDA) # Name of your project
 set(CMAKE_CUDA_ARCHITECTURES 89)
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -mavx2 -mfma")
 set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -O3 -gencode arch=compute_89,code=sm_89 -rdc=true")
-# Set the C++ standard you wish to use (you could use C++11, C++14, C++17, etc.)
-#set(CMAKE_CXX_STANDARD 17)
-#set(CMAKE_CXX_STANDARD_REQUIRED True)
-#set(CMAKE CUDA_STANDARD 12.2)
 
 set(CMAKE_CUDA_SEPARABLE_COMPILATION ON)
 
-
-#find_package(Boost 1.84.0 REQUIRED COMPONENTS json)
-#find_package(Boost COMPONENTS system REQUIRED) # Find Boost system library
-
 find_package(CUDAToolkit REQUIRED)
-# Add executable target with source files
+
 link_libraries(-lcublas -lcusolver -lcudadevrt)
+
 add_executable(CudaPricingGrid 
                main.cu
-               kernels.cu  
-               )
-set_source_files_properties(main.cu kernels.cu PROPERTIES FORCE_LANGUAGE CUDA LINKER_LANGUAGE CUDA)
+               kernels.cu
+               option_pricer.cu)
 
-#add_executable(CudaNse bs.cu)
-#set_target_properties(CudaNse PROPERTIES LINKER_LANGUAGE CUDA CUDA_ARCHITECTURES 89)
+set_source_files_properties(main.cu kernels.cu option_pricer.cu PROPERTIES FORCE_LANGUAGE CUDA LINKER_LANGUAGE CUDA)
 
-
-#target_link_libraries(NSEDataCollection Boost::system ssl crypto ${CMAKE_DL_LIBS} pthread)
 include_directories(/usr/local/cuda-12.5/include)
-#target_link_libraries(NSEDataCollection Boost::json Boost::system OpenSSL::SSL OpenSSL::Crypto ${CMAKE_DL_LIBS} pthread)
-
-#target_link_options(NSEDataCollection PRIVATE -lssl -lcrypto)
-
-# If you have include directories you wish to add, you can use include_directories
 include_directories(${PROJECT_SOURCE_DIR}/include)
-
-# If you have libraries to link against, use target_link_libraries
-# target_link_libraries(MyExecutable myLibrary)
