@@ -13,11 +13,11 @@ link_libraries(-lcublas -lcusolver -lcudadevrt)
 
 add_executable(CudaPricingGrid 
                main.cu
-               kernels.cu
-               option_pricer.cu
-               gpu_optimizer.cu)
+               src/kernels.cu
+               src/option_pricer.cu
+               src/gpu_optimizer.cu)
 
-set_source_files_properties(main.cu kernels.cu option_pricer.cu gpu_optimizer.cu PROPERTIES FORCE_LANGUAGE CUDA LINKER_LANGUAGE CUDA)
+set_source_files_properties(main.cu src/kernels.cu src/option_pricer.cu src/gpu_optimizer.cu PROPERTIES FORCE_LANGUAGE CUDA LINKER_LANGUAGE CUDA)
 
 include_directories(/usr/local/cuda-12.5/include)
 include_directories(${PROJECT_SOURCE_DIR}/include)
