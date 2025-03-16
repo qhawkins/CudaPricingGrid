@@ -3,81 +3,83 @@
 
 #include <vector>
 #include <iostream>
-#include <cmath>
 #include <cuda_runtime.h>
 #include "structs.h"
 
-// Define a macro for CUDA error checking
+// Macro for checking CUDA errors
 #define CHECK_CUDA_ERROR(val) { checkCudaError((val), __FILE__, __LINE__); }
-
-// Helper function for CUDA error checking
-inline void checkCudaError(cudaError_t code, const char *file, int line) {
-    if (code != cudaSuccess) {
-        fprintf(stderr, "CUDA Error: %s at %s:%d\n", cudaGetErrorString(code), file, line);
-        exit(EXIT_FAILURE);
+inline void checkCudaError(cudaError_t result, const char* file, int line) {
+    if (result != cudaSuccess) {
+        std::cerr << "CUDA Error: " << cudaGetErrorString(result) << " at: " << file << ":" << line << std::endl;
+        exit(result);
     }
 }
 
-// Forward declarations of CUDA kernels
-__global__ void priceOptionsKernel(
-    int steps, int num_options, 
-    double* S, double* K, double* r, double* q, 
-    double* T, double* sigma, int* optionType, 
-    double* prices
-);
-
-__global__ void computeImpliedVolatilityKernel(
-    int steps, int num_options, 
-    double* marketPrices, double* S, double* K, 
-    double* r, double* q, double* T, 
-    int* optionType, double* ivResults, 
-    double tol, int max_iter
-);
-
-// CRROptionPricer class declaration
-class CRROptionPricer {
+// Enhanced CRROptionPricer class with optimized memory management
+class OptimizedCRROptionPricer {
 private:
-    // Host data
-    double *S, *K, *r, *q, *T, *marketPrices;
-    int *optionType;
-    int steps, max_iter;
-    double tol;
     int batch_size;
-
-    // Device data
+    bool use_pinned_memory;
+    
+    // Host pinned memory for all inputs
+    double *h_S, *h_K, *h_r, *h_q, *h_T, *h_marketPrices;
+    int *h_optionType;
+    
+    // Device memory pointers
     double *d_S, *d_K, *d_r, *d_q, *d_T;
-    int *d_optionType;
     double *d_price, *d_prices, *d_values;
-    double *d_price_low, *d_price_high, *d_price_mid;
     double *d_sigma;
-    double *d_ivResults;
-    double *d_marketPrices;
-    double *d_shifted_S, *d_shifted_K, *d_shifted_r, *d_shifted_q, *d_shifted_T, *d_shifted_sigma;
-    int *d_shifted_optionType;
-    double *d_shifted_prices;
-
+    double *d_price_low, *d_price_high, *d_price_mid;
+    double *d_ivResults, *d_marketPrices;
+    int *d_optionType;
+    
+    // Stream for asynchronous operations
     cudaStream_t stream;
+    
+    // Parameters
+    int steps;
+    double tol;
+    int max_iter;
+    
+    // Greeks parameter buffers
+    double *d_greeks_delta, *d_greeks_gamma, *d_greeks_theta, *d_greeks_vega;
+    
+    // Private methods
+    void allocateMemory();
+    void freeMemory();
 
 public:
-    // Constructor
-    CRROptionPricer(int batch_size_, double* marketPrices_, double* S_, double* K_, 
-                   double* r_, double* q_, double* T_, int steps_, 
-                   int* type_, double tol_, int max_iter_, cudaStream_t stream_);
-
-    // Destructor
-    ~CRROptionPricer();
-
-    // Function to retrieve option prices asynchronously
-    void retrieveOptionPrices(std::vector<double>& host_price);
-
-    // Function to calculate all Greeks
-    std::vector<Greeks> calculateAllGreeks(const GreekParams& params, const std::vector<double>& sigma);
-
-    // Function to print Greeks for an option
-    void printGreeks(const Greeks& greeks);
-
-    // Function to compute implied volatility
-    std::vector<double> computeImpliedVolatilityDevice();
+    OptimizedCRROptionPricer(int batch_size_, int steps_, 
+                            double tol_, int max_iter_, 
+                            cudaStream_t stream_, bool use_pinned_memory_ = true);
+    ~OptimizedCRROptionPricer();
+    
+    // Set data for computation
+    void setData(const std::vector<double>& S, const std::vector<double>& K,
+                 const std::vector<double>& r, const std::vector<double>& q,
+                 const std::vector<double>& T, const std::vector<int>& optionType,
+                 const std::vector<double>& marketPrices);
+    
+    // Compute implied volatility and greeks in a single batch
+    void computeAllInOne(std::vector<double>& impliedVols, 
+                         std::vector<Greeks>& greeks,
+                         double dSpot = 0.01, double dVol = 0.01);
+                         
+    // Fused kernel method to compute both IV and Greeks
+    void launchFusedComputation();
 };
+
+// Launch a fused kernel to compute IV and Greeks directly
+__global__ void fusedComputationKernel(
+    int steps, int batchSize, 
+    const double* marketPrices, 
+    const double* S, const double* K, 
+    const double* r, const double* q, 
+    const double* T, const int* optionType,
+    double* ivResults, double* deltaResults, 
+    double* gammaResults, double* thetaResults, 
+    double* vegaResults,
+    double dSpot, double dVol,
+    double tol, int max_iter);
 
 #endif // OPTION_PRICER_CUH
